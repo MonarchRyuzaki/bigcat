@@ -1,0 +1,71 @@
+# BigCat: Phase 1 Benchmark Report
+
+Comprehensive performance and allocation benchmarks for **BigCat (Phase 1: Single-File Storage Engine)**.
+
+---
+
+## Benchmark Environment
+* **OS:** Linux 6.8 (x86_64)
+* **CPU:** AMD Ryzen 5 5600H with Radeon Graphics (6 Cores / 12 Threads @ 3.30GHz - 4.20GHz)
+* **Go Version:** `go1.27.4 linux/amd64`
+* **Compiler Flags:** `-benchmem`
+
+---
+
+## 1. End-to-End Engine Benchmarks (`bigcat`)
+
+These benchmarks measure the complete lifecycle through the public `DB` API (`Put` and `Get`), including serialization, append-only file I/O, CRC32 checksums, and in-memory `KeyDir` indexing.
+
+| Benchmark | Operations | Latency | Memory / Op | Allocs / Op | Est. Throughput |
+|---|---|---|---|---|---|
+| `BenchmarkDB_Put` | 755,809 | **1,582 ns/op** (1.58 µs) | 144 B/op | 3 allocs/op | **~632,000 writes/sec** |
+| `BenchmarkDB_Get` | 1,511,034 | **778.3 ns/op** (0.78 µs) | 144 B/op | 3 allocs/op | **~1,285,000 reads/sec** |
+
+### Key Takeaways:
+* **Over 1.28 Million Point Lookups/sec:** Random reads complete in sub-microsecond latency (778 ns) thanks to the in-memory index lookup combined with a single `pread(2)` syscall.
+* **Over 630,000 Appends/sec:** High write throughput to the OS page cache while calculating CRC32 checksums on every write.
+
+---
+
+## 2. In-Memory Index Benchmarks (`internal/index`)
+
+Measures the in-memory `KeyDir` hash table protected by `sync.RWMutex`.
+
+| Benchmark | Operations | Latency | Memory / Op | Allocs / Op | Est. Throughput |
+|---|---|---|---|---|---|
+| `BenchmarkMapIndex_Put` | 56,350,933 | **21.20 ns/op** | 0 B/op | **0 allocs/op** | **~47.1M ops/sec** |
+| `BenchmarkMapIndex_Get` | 98,408,632 | **12.21 ns/op** | 0 B/op | **0 allocs/op** | **~81.9M ops/sec** |
+| `BenchmarkMapIndex_ParallelGet` (12 threads) | 37,608,440 | **33.59 ns/op** | 0 B/op | **0 allocs/op** | **~29.7M ops/sec** |
+
+### Key Takeaways:
+* **Zero Allocations:** Lookups and updates allocate **0 bytes**, resulting in zero garbage collector pressure.
+* **Massive Concurrency:** Concurrent readers running across all 12 CPU cores execute in ~33 nanoseconds under `RLock`.
+
+---
+
+## 3. Serialization & Codec Benchmarks (`internal/record`)
+
+Measures Little-Endian binary packing, header construction, payload slicing, and CRC32 IEEE computation.
+
+| Benchmark | Operations | Latency | Memory / Op | Allocs / Op | Est. Throughput |
+|---|---|---|---|---|---|
+| `BenchmarkBinaryCodec_Encode` | 19,813,900 | **55.83 ns/op** | 80 B/op | 1 allocs/op | **~17.9M ops/sec** |
+| `BenchmarkBinaryCodec_Decode` (stream `io.Reader`) | 9,850,641 | **148.0 ns/op** | 200 B/op | 4 allocs/op | **~6.7M ops/sec** |
+| `BenchmarkBinaryCodec_DecodeBytes` (contiguous memory) | 23,483,414 | **52.02 ns/op** | 64 B/op | **1 allocs/op** | **~19.2M ops/sec** |
+
+### The Power of `DecodeBytes`:
+* `DecodeBytes` is **almost 3x faster** than streaming `Decode(io.Reader)` because it calculates CRC32 directly across contiguous memory without an intermediate hasher interface and slices keys/values with zero extra allocations.
+
+---
+
+## 4. Storage File I/O Benchmarks (`internal/storage`)
+
+Measures append-only file writes and stateless `pread(2)` random reads directly on disk.
+
+| Benchmark | Operations | Latency | Memory / Op | Allocs / Op | Est. Throughput |
+|---|---|---|---|---|---|
+| `BenchmarkDataFile_Write` | 942,435 | **1,262 ns/op** (1.26 µs) | 0 B/op | **0 allocs/op** | **~792,000 writes/sec** |
+| `BenchmarkDataFile_ReadAt` | 1,789,719 | **668.9 ns/op** (0.67 µs) | 256 B/op | 1 allocs/op | **~1,490,000 reads/sec** |
+
+### Key Takeaways:
+* **Lock-Free Concurrent Reads:** `ReadAt` uses `pread(2)` which bypasses the shared OS file seek pointer, executing in ~669 nanoseconds.
