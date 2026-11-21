@@ -19,36 +19,52 @@ func NewMapIndex() *MapIndex {
 
 // Put inserts or updates an index entry for the given key.
 func (m *MapIndex) Put(key string, item Item) {
-	// TODO: Acquire write lock, update m.items[key], unlock
-	panic("TODO: implement Put")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.items[key] = item
 }
 
 // Get finds an index entry for the given key.
 func (m *MapIndex) Get(key string) (Item, bool) {
-	// TODO: Acquire read lock, read m.items[key], unlock
-	panic("TODO: implement Get")
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	item, ok := m.items[key]
+	return item, ok
 }
 
 // Delete removes an entry from the index.
 func (m *MapIndex) Delete(key string) {
-	// TODO: Acquire write lock, delete key from m.items, unlock
-	panic("TODO: implement Delete")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.items, key)
 }
 
 // Keys returns a slice of all active keys in the index.
 func (m *MapIndex) Keys() []string {
-	// TODO: Acquire read lock, collect all keys into a []string, unlock
-	panic("TODO: implement Keys")
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	keys := make([]string, len(m.items))
+	i := 0
+	for k := range m.items {
+		keys[i] = k
+		i++
+	}
+	return keys
 }
 
 // Size returns the count of active keys.
 func (m *MapIndex) Size() int {
-	// TODO: Acquire read lock, return len(m.items), unlock
-	panic("TODO: implement Size")
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.items)
 }
 
-// Close cleans up index resources.
+// Close cleans up index resources by freeing the in-memory map.
+// This allows Go's Garbage Collector to immediately reclaim RAM.
+// It does NOT delete or touch any persistent data on disk!
 func (m *MapIndex) Close() error {
-	// TODO: clear items map if necessary
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.items = nil
 	return nil
 }
