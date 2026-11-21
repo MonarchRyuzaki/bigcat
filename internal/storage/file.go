@@ -15,38 +15,65 @@ type DataFile struct {
 
 // OpenDataFile opens or creates a data file at the specified path.
 func OpenDataFile(path string) (*DataFile, error) {
-	// TODO:
+	// DONE:
 	// 1. Open file with os.O_CREATE|os.O_RDWR|os.O_APPEND
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
 	// 2. Query file stat to get the initial offset (file size)
+	stat, err := file.Stat()
+	if err != nil {
+		_ = file.Close() // Guard against file descriptor leak
+		return nil, err
+	}
+	offset := stat.Size()
 	// 3. Return initialized *DataFile
-	panic("TODO: implement OpenDataFile")
+	return &DataFile{
+		file:   file,
+		offset: offset,
+	}, nil
 }
 
 // Write appends raw bytes to the end of the data file and returns the offset
 // where the bytes were written.
 func (df *DataFile) Write(data []byte) (offset int64, err error) {
-	// TODO:
+	// DONE:
 	// 1. Acquire write lock
+	df.mu.Lock()
+	defer df.mu.Unlock()
 	// 2. Write data to file
+	n, err := df.file.Write(data)
+	if err != nil {
+		return 0, err
+	}
 	// 3. Update df.offset
+	off := df.offset
+	df.offset += int64(n)
 	// 4. Return the offset where this record began
-	panic("TODO: implement Write")
+	return off, nil
 }
 
 // ReadAt reads length bytes starting at the given offset.
 // This operation does not move the file write pointer and is safe for concurrent calls.
 func (df *DataFile) ReadAt(offset int64, length uint32) ([]byte, error) {
-	// TODO:
+	// DONE:
 	// 1. Allocate buffer of size length
+	buffer := make([]byte, length)
 	// 2. Call df.file.ReadAt(buf, offset)
+	_, err := df.file.ReadAt(buffer, offset)
+	if err != nil {
+		return nil, err
+	}
 	// 3. Return buffer
-	panic("TODO: implement ReadAt")
+	return buffer, nil
 }
 
 // Sync commits the current contents of the file to stable storage (fsync).
 func (df *DataFile) Sync() error {
-	// TODO: Call df.file.Sync()
-	panic("TODO: implement Sync")
+	// DONE: Call df.file.Sync()
+	err := df.file.Sync()
+	return err
 }
 
 // Size returns the current size (offset) of the data file.
@@ -58,6 +85,7 @@ func (df *DataFile) Size() int64 {
 
 // Close flushes and closes the underlying OS file.
 func (df *DataFile) Close() error {
-	// TODO: Call df.file.Close()
-	panic("TODO: implement Close")
+	df.mu.Lock()
+	defer df.mu.Unlock()
+	return df.file.Close()
 }
