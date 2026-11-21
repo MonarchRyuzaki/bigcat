@@ -115,13 +115,13 @@ type Item struct {
 
 ## 5. Multi-Phase Roadmap
 
-### Phase 1: Single-File Storage Engine (Current Goal)
-- [ ] Define `Record`, `RecordType`, and `Codec` interface in `internal/record`.
-- [ ] Implement Little-Endian Binary Codec with CRC32 check and clear comments.
-- [ ] Define `Indexer` interface and in-memory map implementation in `internal/index`.
-- [ ] Implement single-file data storage in `internal/storage`.
-- [ ] Wire up main engine `DB`: `Open`, `Put`, `Get`, `Delete`, `Close`.
-- [ ] Unit & integration tests written via `bigcat-test-writer`.
+### Phase 1: Single-File Storage Engine (COMPLETED ✅)
+- [x] Define `Record`, `RecordType`, and `Codec` interface in `internal/record`.
+- [x] Implement Little-Endian Binary Codec with CRC32 check and clear comments.
+- [x] Define `Indexer` interface and in-memory map implementation in `internal/index`.
+- [x] Implement single-file data storage in `internal/storage`.
+- [x] Wire up main engine `DB`: `Open`, `Put`, `Get`, `Delete`, `Close`.
+- [x] Unit & integration tests written via `bigcat-test-writer`.
 
 ### Phase 2: Multi-File Rotation & Directory Management
 - [ ] Configurable file size threshold (e.g. 64MB).
