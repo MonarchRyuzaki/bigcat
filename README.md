@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/bigcat-banner.jpg" alt="BigCat Banner" width="100%">
+</p>
+
 # 🐾 BigCat
 
 A fast, lightweight, and embeddable log-structured key-value storage engine in Go, inspired by Bitcask.
