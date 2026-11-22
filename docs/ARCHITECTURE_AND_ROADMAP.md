@@ -133,9 +133,11 @@ type Item struct {
 - [ ] Generation of `.hint` files containing only index headers (`Timestamp | KeySize | ValueSize | RecordOffset | Key`).
 - [ ] Fast startup: Load `.hint` files first instead of scanning multi-gigabyte data files.
 
-### Phase 4: CLI Interfaces
-- [ ] Simple interactive REPL / string-based CLI.
-- [ ] Upgrade to RESP (Redis Serialization Protocol) server so `redis-cli` can connect to BigCat!
+### Phase 4: RESP Protocol Server & CLI (COMPLETED ✅)
+- [x] RESP v2 parser and serializer (`internal/resp`).
+- [x] TCP command dispatcher (`PING`, `SET`, `GET`, `DEL`, `KEYS`, `COMMAND`, `CONFIG`, `QUIT`).
+- [x] Full compatibility with `redis-cli` and `redis-benchmark`.
+- [x] Standalone binary in `./bin/bigcat` with CLI flags and graceful shutdown.
 
 ### Phase 5: Distributed BigCat
 - [ ] Containerization (Docker / Compose).

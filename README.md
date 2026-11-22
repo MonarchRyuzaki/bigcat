@@ -72,7 +72,44 @@ Tested on an **AMD Ryzen 5 5600H (Linux x86_64)**:
 
 ---
 
-## Quick Start
+## Running the Server & Using `redis-cli`
+
+BigCat includes a built-in TCP server that speaks the **Redis Serialization Protocol (RESP v2)** natively:
+
+```bash
+# 1. Build and start BigCat
+go build -o bin/bigcat ./cmd/bigcat
+./bin/bigcat -port 6380 -dir ./data
+```
+
+```text
+    /\_____/\
+   /  o   o  \     🐾 BigCat Key-Value Storage Engine
+  ( ==  ^  == )    ------------------------------------
+   )         (     📡 Port:     6380
+  (           )    📂 Data Dir: ./data
+ ( (  |   |  ) )   ⚡ Client:   redis-cli -p 6380
+(__(__)___(__)__)  ------------------------------------
+```
+
+Now connect directly with `redis-cli`:
+```bash
+redis-cli -p 6380
+127.0.0.1:6380> PING
+PONG
+127.0.0.1:6380> SET myhero "batman"
+OK
+127.0.0.1:6380> GET myhero
+"batman"
+127.0.0.1:6380> KEYS *
+1) "myhero"
+127.0.0.1:6380> DEL myhero
+(integer) 1
+```
+
+---
+
+## Go API Quick Start
 
 ```go
 package main
@@ -121,6 +158,10 @@ func main() {
   - [x] Append-only file manager with stateless `pread` reads
   - [x] Crash recovery and sequential startup scan
   - [x] Comprehensive test suite & benchmarks
+- [x] **RESP Protocol Server & CLI**
+  - [x] RESP v2 parser and serializer (`internal/resp`)
+  - [x] TCP command dispatcher (`PING`, `SET`, `GET`, `DEL`, `KEYS`, `COMMAND`, `QUIT`)
+  - [x] Full compatibility with `redis-cli` and `redis-benchmark`
 - [ ] **Phase 2: Multi-File Rotation & Directory Management**
   - [ ] File rotation upon reaching size threshold (e.g. 64MB)
   - [ ] Multiple immutable older files + 1 active file
@@ -128,9 +169,6 @@ func main() {
 - [ ] **Phase 3: Compaction / Merging & Hint Files**
   - [ ] Background garbage collection of overwritten/deleted records
   - [ ] `.hint` files for near-instant cold startups
-- [ ] **Phase 4: CLI Interfaces**
-  - [ ] Interactive REPL
-  - [ ] RESP (Redis Serialization Protocol) server for `redis-cli` compatibility
-- [ ] **Phase 5: Distributed BigCat**
+- [ ] **Phase 4: Distributed BigCat**
   - [ ] Docker containerization
   - [ ] Raft consensus & replicated state machine
