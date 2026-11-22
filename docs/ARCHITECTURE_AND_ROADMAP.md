@@ -123,10 +123,11 @@ type Item struct {
 - [x] Wire up main engine `DB`: `Open`, `Put`, `Get`, `Delete`, `Close`.
 - [x] Unit & integration tests written via `bigcat-test-writer`.
 
-### Phase 2: Multi-File Rotation & Directory Management
-- [ ] Configurable file size threshold (e.g. 64MB).
-- [ ] Active file (write-only append) vs Immutable older files (read-only).
-- [ ] Directory scanner and startup recovery (rebuilding `KeyDir` from all files in sequence).
+### Phase 2: Multi-File Rotation & Directory Management (COMPLETED ✅)
+- [x] Configurable file size threshold (e.g. 64MB) via `WithMaxFileSize` and `-max-file-size` CLI flag.
+- [x] Active file (write-only append) vs Immutable older files map (`map[uint32]*DataFile`).
+- [x] Directory scanner and startup recovery (rebuilding `KeyDir` from all files in ascending sequence).
+- [x] Tombstone replay and lifecycle across multiple rotated files.
 
 ### Phase 2.5: High-Concurrency Write Optimizations (Group Commit & Lock Elision)
 - [ ] Pre-encode & compute CRC32 checksums outside the write mutex (fine-grained locking).

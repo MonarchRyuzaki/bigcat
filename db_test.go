@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"bigcat/internal/storage"
 )
 
 func TestDB_BasicCRUD(t *testing.T) {
@@ -221,8 +223,8 @@ func TestDB_CorruptedRecordDetectionOnStartup(t *testing.T) {
 	}
 	db.Close()
 
-	// Corrupt a byte in data.db
-	filePath := filepath.Join(dir, defaultDataFileName)
+	// Corrupt a byte in 00000.data
+	filePath := filepath.Join(dir, storage.DataFileName(0))
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		t.Fatalf("read file failed: %v", err)
@@ -286,6 +288,150 @@ func TestDB_ConcurrentAccess(t *testing.T) {
 	keys := db.Keys()
 	if len(keys) == 0 {
 		t.Fatalf("expected non-empty keys after concurrent operations")
+	}
+}
+
+func TestDB_MultiFileRotationAndRecovery(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Open with 512-byte max file size
+	db1, err := Open(dir, WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	const numKeys = 40
+	for i := 0; i < numKeys; i++ {
+		k := []byte(fmt.Sprintf("rot_key_%03d", i))
+		v := []byte(fmt.Sprintf("rot_val_%03d_padding_data_to_fill_space", i))
+		if err := db1.Put(k, v); err != nil {
+			t.Fatalf("Put key %d failed: %v", i, err)
+		}
+	}
+
+	// Verify all keys readable before close
+	for i := 0; i < numKeys; i++ {
+		k := []byte(fmt.Sprintf("rot_key_%03d", i))
+		expected := []byte(fmt.Sprintf("rot_val_%03d_padding_data_to_fill_space", i))
+		got, err := db1.Get(k)
+		if err != nil || !bytes.Equal(got, expected) {
+			t.Fatalf("Get key %d failed: err=%v, match=%v", i, err, bytes.Equal(got, expected))
+		}
+	}
+
+	// Overwrite some keys (10..19)
+	for i := 10; i < 20; i++ {
+		k := []byte(fmt.Sprintf("rot_key_%03d", i))
+		newVal := []byte(fmt.Sprintf("OVERWRITTEN_%03d_value_data", i))
+		if err := db1.Put(k, newVal); err != nil {
+			t.Fatalf("Put overwrite %d failed: %v", i, err)
+		}
+	}
+
+	// Delete some keys (0..9)
+	for i := 0; i < 10; i++ {
+		k := []byte(fmt.Sprintf("rot_key_%03d", i))
+		if err := db1.Delete(k); err != nil {
+			t.Fatalf("Delete key %d failed: %v", i, err)
+		}
+	}
+
+	// Close DB
+	if err := db1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// 2. Re-open DB (tests multi-file recovery, tombstone replay across files, and overwritten value replay)
+	db2, err := Open(dir, WithMaxFileSize(512))
+	if err != nil {
+		t.Fatalf("Re-Open failed: %v", err)
+	}
+	defer db2.Close()
+
+	// Verify deleted keys (0..9) return ErrKeyNotFound
+	for i := 0; i < 10; i++ {
+		k := []byte(fmt.Sprintf("rot_key_%03d", i))
+		if _, err := db2.Get(k); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("expected deleted key %s to not be found, got %v", k, err)
+		}
+	}
+
+	// Verify overwritten keys (10..19) return updated values
+	for i := 10; i < 20; i++ {
+		k := []byte(fmt.Sprintf("rot_key_%03d", i))
+		expected := []byte(fmt.Sprintf("OVERWRITTEN_%03d_value_data", i))
+		got, err := db2.Get(k)
+		if err != nil || !bytes.Equal(got, expected) {
+			t.Fatalf("overwritten key %d mismatch: expected %s, got %s (err: %v)", i, expected, got, err)
+		}
+	}
+
+	// Verify untouched keys (20..39) return original values
+	for i := 20; i < numKeys; i++ {
+		k := []byte(fmt.Sprintf("rot_key_%03d", i))
+		expected := []byte(fmt.Sprintf("rot_val_%03d_padding_data_to_fill_space", i))
+		got, err := db2.Get(k)
+		if err != nil || !bytes.Equal(got, expected) {
+			t.Fatalf("untouched key %d mismatch: expected %s, got %s (err: %v)", i, expected, got, err)
+		}
+	}
+
+	// Verify writing to active file after recovery works
+	newKey := []byte("brand_new_key_after_restart")
+	newVal := []byte("fresh_data_in_active_file")
+	if err := db2.Put(newKey, newVal); err != nil {
+		t.Fatalf("Put new key after restart failed: %v", err)
+	}
+	got, err := db2.Get(newKey)
+	if err != nil || !bytes.Equal(got, newVal) {
+		t.Fatalf("Get new key mismatch: expected %s, got %s", newVal, got)
+	}
+}
+
+func TestDB_TombstoneReplayLifecycleAcrossFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Small threshold to force rotation between operations
+	db1, err := Open(dir, WithMaxFileSize(100))
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	key := []byte("lifecycle_key")
+
+	// 1. Write initial key (file 0)
+	if err := db1.Put(key, []byte("value_one_padding_to_exceed_file_size")); err != nil {
+		t.Fatalf("Put 1 failed: %v", err)
+	}
+
+	// 2. Delete key (tombstone in rotated file)
+	if err := db1.Delete(key); err != nil {
+		t.Fatalf("Delete 1 failed: %v", err)
+	}
+
+	// 3. Re-insert key with new value
+	if err := db1.Put(key, []byte("value_two_resurrected_key_payload")); err != nil {
+		t.Fatalf("Put 2 failed: %v", err)
+	}
+
+	// 4. Delete key again (tombstone is final ground truth)
+	if err := db1.Delete(key); err != nil {
+		t.Fatalf("Delete 2 failed: %v", err)
+	}
+
+	if err := db1.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen database from disk and verify the key is deleted
+	db2, err := Open(dir, WithMaxFileSize(100))
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	defer db2.Close()
+
+	if _, err := db2.Get(key); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("expected key to remain deleted after lifecycle replay, got err: %v", err)
 	}
 }
 
