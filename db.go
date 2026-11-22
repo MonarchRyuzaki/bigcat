@@ -12,24 +12,19 @@ import (
 	"bigcat/internal/storage"
 )
 
-const (
-	// defaultDataFileName is the filename of the single active data file for Phase 1.
-	defaultDataFileName = "data.db"
-)
-
 // DB represents a BigCat key-value storage engine instance.
-// It coordinates an append-only DataFile on disk with an in-memory KeyDir index.
+// It coordinates append-only multi-file storage on disk with an in-memory KeyDir index.
 type DB struct {
 	mu       sync.RWMutex
 	options  Options
-	active   *storage.DataFile
+	storage  *storage.FileManager
 	index    index.Indexer
 	codec    record.Codec
 	isClosed bool
 }
 
 // Open initializes and opens a BigCat storage engine instance in the specified directory.
-// On startup, it scans the active data file sequentially to rebuild the in-memory KeyDir.
+// On startup, it scans all data files sequentially in ascending order to rebuild the in-memory KeyDir.
 func Open(dirPath string, opts ...Option) (*DB, error) {
 	// 1. Initialize Options (apply defaults and user-provided functional options)
 	options := DefaultOptions(dirPath)
@@ -42,9 +37,8 @@ func Open(dirPath string, opts ...Option) (*DB, error) {
 		return nil, err
 	}
 
-	// 3. Open the active data file in dirPath (e.g., data.db) via storage.OpenDataFile
-	dataFilePath := filepath.Join(dirPath, defaultDataFileName)
-	dataFile, err := storage.OpenDataFile(dataFilePath)
+	// 3. Initialize multi-file storage manager
+	fileManager, err := storage.OpenFileManager(dirPath, options.MaxFileSize)
 	if err != nil {
 		return nil, err
 	}
@@ -55,14 +49,14 @@ func Open(dirPath string, opts ...Option) (*DB, error) {
 
 	db := &DB{
 		options: options,
-		active:  dataFile,
+		storage: fileManager,
 		index:   idx,
 		codec:   cdc,
 	}
 
-	// 5. Build in-memory KeyDir by sequentially scanning the data file from offset 0
-	if err := db.loadIndexFromDisk(dataFilePath); err != nil {
-		_ = dataFile.Close()
+	// 5. Build in-memory KeyDir by sequentially scanning all data files from offset 0
+	if err := db.loadIndexFromDisk(); err != nil {
+		_ = fileManager.Close()
 		_ = idx.Close()
 		return nil, err
 	}
@@ -70,15 +64,32 @@ func Open(dirPath string, opts ...Option) (*DB, error) {
 	return db, nil
 }
 
-// loadIndexFromDisk scans dataFilePath from byte 0 to EOF to recover the in-memory KeyDir index.
-// It wraps the file in a buffered reader (bufio.Reader) to minimize disk syscalls.
-func (db *DB) loadIndexFromDisk(dataFilePath string) error {
-	file, err := os.Open(dataFilePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+// loadIndexFromDisk scans all managed data files in ascending order to recover the in-memory KeyDir index.
+// It wraps each file in a 256KB buffered reader to minimize disk syscalls during startup.
+func (db *DB) loadIndexFromDisk() error {
+	// FileIDs() returns all file IDs sorted in ascending order (e.g. 00000, 00001, ...)
+	fileIDs := db.storage.FileIDs()
 
+	for _, fileID := range fileIDs {
+		filePath := filepath.Join(db.options.DirPath, storage.DataFileName(fileID))
+		file, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+
+		if err := db.scanDataFile(fileID, file); err != nil {
+			_ = file.Close()
+			return err
+		}
+
+		_ = file.Close()
+	}
+
+	return nil
+}
+
+// scanDataFile sequentially reads records from a single data file and updates the in-memory index.
+func (db *DB) scanDataFile(fileID uint32, file *os.File) error {
 	// Use a 256KB buffer so sequential reads happen in userspace memory
 	reader := bufio.NewReaderSize(file, 256*1024)
 	var currentOffset int64 = 0
@@ -101,8 +112,9 @@ func (db *DB) loadIndexFromDisk(dataFilePath string) error {
 		if rec.Type == record.RecordTypeTombstone {
 			db.index.Delete(string(rec.Key))
 		} else if rec.Type == record.RecordTypeNormal {
-			// Populate or overwrite index with the latest active offset
+			// Populate or overwrite index with the latest active offset and fileID
 			db.index.Put(string(rec.Key), index.Item{
+				FileID:       fileID,
 				RecordOffset: currentOffset,
 				RecordSize:   recordSize,
 				Timestamp:    rec.Timestamp,
@@ -117,7 +129,8 @@ func (db *DB) loadIndexFromDisk(dataFilePath string) error {
 }
 
 // Put writes a key-value pair to the database.
-// It serializes the record, appends it to disk, and updates the in-memory index.
+// It serializes the record, appends it to disk (rotating files if threshold is reached),
+// and updates the in-memory index with the file ID and record offset.
 func (db *DB) Put(key, value []byte) error {
 	if len(key) == 0 {
 		return ErrEmptyKey
@@ -139,14 +152,15 @@ func (db *DB) Put(key, value []byte) error {
 		return err
 	}
 
-	// 3. Append to disk log
-	offset, err := db.active.Write(encoded)
+	// 3. Append to disk log (FileManager handles rotation if maxFileSize is exceeded)
+	fileID, offset, err := db.storage.Write(encoded)
 	if err != nil {
 		return err
 	}
 
-	// 4. Update in-memory index with offset and record size
+	// 4. Update in-memory index with fileID, offset, and record size
 	db.index.Put(string(key), index.Item{
+		FileID:       fileID,
 		RecordOffset: offset,
 		RecordSize:   uint32(len(encoded)),
 		Timestamp:    rec.Timestamp,
@@ -154,7 +168,7 @@ func (db *DB) Put(key, value []byte) error {
 
 	// 5. Optionally flush to disk if SyncOnWrite is configured
 	if db.options.SyncOnWrite {
-		if err := db.active.Sync(); err != nil {
+		if err := db.storage.Sync(); err != nil {
 			return err
 		}
 	}
@@ -164,7 +178,7 @@ func (db *DB) Put(key, value []byte) error {
 
 // Get retrieves the value for the given key.
 // It looks up the record location in KeyDir, executes a single ReadAt syscall for
-// the entire record, and verifies CRC in-memory via DecodeBytes.
+// the entire record from the corresponding data file, and verifies CRC in-memory via DecodeBytes.
 func (db *DB) Get(key []byte) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrEmptyKey
@@ -183,8 +197,8 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return nil, ErrKeyNotFound
 	}
 
-	// 2. Read the entire record in exactly 1 pread syscall
-	data, err := db.active.ReadAt(item.RecordOffset, item.RecordSize)
+	// 2. Read the entire record in exactly 1 pread syscall from the target file (active or older)
+	data, err := db.storage.ReadAt(item.FileID, item.RecordOffset, item.RecordSize)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +244,7 @@ func (db *DB) Delete(key []byte) error {
 	}
 
 	// 3. Append tombstone record to disk
-	if _, err := db.active.Write(encoded); err != nil {
+	if _, _, err := db.storage.Write(encoded); err != nil {
 		return err
 	}
 
@@ -239,7 +253,7 @@ func (db *DB) Delete(key []byte) error {
 
 	// 5. Optionally flush to disk
 	if db.options.SyncOnWrite {
-		if err := db.active.Sync(); err != nil {
+		if err := db.storage.Sync(); err != nil {
 			return err
 		}
 	}
@@ -266,10 +280,10 @@ func (db *DB) Sync() error {
 	if db.isClosed {
 		return ErrDatabaseClosed
 	}
-	return db.active.Sync()
+	return db.storage.Sync()
 }
 
-// Close flushes data to disk and closes the active file and index.
+// Close flushes data to disk and closes all open data files and index.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -280,12 +294,8 @@ func (db *DB) Close() error {
 
 	db.isClosed = true
 
-	// Sync and close active data file
-	if err := db.active.Sync(); err != nil {
-		_ = db.active.Close()
-		return err
-	}
-	if err := db.active.Close(); err != nil {
+	// Sync and close all data files via FileManager
+	if err := db.storage.Close(); err != nil {
 		return err
 	}
 

@@ -3,6 +3,9 @@ package index
 // Item stores metadata in memory for an active key on disk.
 // In Bitcask, keeping this in RAM ensures every read requires only one disk seek.
 type Item struct {
+	// FileID is the identifier of the data file storing this record.
+	FileID uint32
+
 	// RecordOffset is the absolute byte offset in the data file where the record begins.
 	RecordOffset int64
 

@@ -16,22 +16,25 @@ func main() {
 	port := flag.Int("port", 6380, "Port to listen on (default 6380)")
 	dataDir := flag.String("dir", "./data", "Directory to store BigCat data files")
 	syncOnWrite := flag.Bool("sync", true, "fsync data to disk after every write operation")
+	maxFileSize := flag.Int64("max-file-size", bigcat.DefaultMaxFileSize, "Maximum size in bytes before rotating data files")
 	flag.Parse()
 
 	banner := `
     /\_____/\
    /  o   o  \     🐾 BigCat Key-Value Storage Engine
   ( ==  ^  == )    ------------------------------------
-   )         (     📡 Port:     %d
-  (           )    📂 Data Dir: %s
- ( (  |   |  ) )   ⚡ Client:   redis-cli -p %d
-(__(__)___(__)__)  ------------------------------------
+   )         (     📡 Port:        %d
+  (           )    📂 Data Dir:    %s
+ ( (  |   |  ) )   📏 Max File:    %d MB
+(__(__)___(__)__)  ⚡ Client:      redis-cli -p %d
+                   ------------------------------------
 `
-	fmt.Printf(banner, *port, *dataDir, *port)
+	fmt.Printf(banner, *port, *dataDir, *maxFileSize/(1024*1024), *port)
 
 	// 1. Open BigCat DB
 	opts := []bigcat.Option{
 		bigcat.WithSyncOnWrite(*syncOnWrite),
+		bigcat.WithMaxFileSize(*maxFileSize),
 	}
 	db, err := bigcat.Open(*dataDir, opts...)
 	if err != nil {

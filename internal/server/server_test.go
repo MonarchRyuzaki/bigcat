@@ -117,6 +117,70 @@ func TestServer_CommandsOverTCP(t *testing.T) {
 	}
 }
 
+func TestServer_MultiFileRotationOverTCP(t *testing.T) {
+	dir := t.TempDir()
+	// Set small 256-byte max file size to trigger multiple rotations over TCP
+	db, err := bigcat.Open(dir, bigcat.WithMaxFileSize(256))
+	if err != nil {
+		t.Fatalf("Open DB failed: %v", err)
+	}
+
+	srv := NewServer(db, "127.0.0.1:0")
+	go func() {
+		_ = srv.Start()
+	}()
+	<-srv.Ready()
+	defer srv.Stop()
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial server: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	sendAndReceive := func(cmd string) string {
+		if _, err := conn.Write([]byte(cmd + "\r\n")); err != nil {
+			t.Fatalf("failed to write cmd %s: %v", cmd, err)
+		}
+		resp, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("failed to read response for cmd %s: %v", cmd, err)
+		}
+		return strings.TrimRight(resp, "\r\n")
+	}
+
+	// 1. Write 15 keys over TCP (causing multiple rotations)
+	for i := 0; i < 15; i++ {
+		cmd := "SET key:" + string(rune('a'+i)) + " value_payload_number_" + string(rune('0'+i))
+		if res := sendAndReceive(cmd); res != "+OK" {
+			t.Fatalf("expected +OK, got %q for cmd %s", res, cmd)
+		}
+	}
+
+	// 2. Read back all 15 keys over TCP
+	for i := 0; i < 15; i++ {
+		cmd := "GET key:" + string(rune('a'+i))
+		res := sendAndReceive(cmd)
+		if !strings.HasPrefix(res, "$") {
+			t.Fatalf("expected bulk string prefix $, got %q for %s", res, cmd)
+		}
+		payload, _ := reader.ReadString('\n')
+		expected := "value_payload_number_" + string(rune('0'+i))
+		if strings.TrimRight(payload, "\r\n") != expected {
+			t.Fatalf("value mismatch: expected %s, got %s", expected, payload)
+		}
+	}
+
+	// 3. Delete an older key
+	if res := sendAndReceive("DEL key:a"); res != ":1" {
+		t.Fatalf("expected :1 for DEL key:a, got %q", res)
+	}
+	if res := sendAndReceive("GET key:a"); res != "$-1" {
+		t.Fatalf("expected $-1 for deleted key:a, got %q", res)
+	}
+}
+
 
 func BenchmarkServer_SetOverTCP(b *testing.B) {
 	dir := b.TempDir()
