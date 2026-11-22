@@ -38,3 +38,4 @@ bin/
 
 # BigCat database data directory
 data/
+test_rotation/

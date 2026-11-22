@@ -9,30 +9,50 @@ import (
 // Writes always append to the end of the file; reads can happen concurrently at any offset.
 type DataFile struct {
 	mu     sync.RWMutex
+	id     uint32
 	file   *os.File
 	offset int64 // Current end of file / write offset
 }
 
-// OpenDataFile opens or creates a data file at the specified path.
+// OpenDataFile opens or creates a read-write append data file at the specified path with id 0.
 func OpenDataFile(path string) (*DataFile, error) {
-	// DONE:
-	// 1. Open file with os.O_CREATE|os.O_RDWR|os.O_APPEND
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	return OpenDataFileWithMode(path, 0, false)
+}
+
+// OpenDataFileWithMode opens a data file at path with a specific ID.
+// If readOnly is true, it opens the file with os.O_RDONLY (for sealed, immutable files).
+// If readOnly is false, it opens the file with os.O_CREATE|os.O_RDWR|os.O_APPEND (for the active file).
+func OpenDataFileWithMode(path string, id uint32, readOnly bool) (*DataFile, error) {
+	var flag int
+	if readOnly {
+		flag = os.O_RDONLY
+	} else {
+		flag = os.O_CREATE | os.O_RDWR | os.O_APPEND
+	}
+
+	file, err := os.OpenFile(path, flag, 0644)
 	if err != nil {
 		return nil, err
 	}
-	// 2. Query file stat to get the initial offset (file size)
+
 	stat, err := file.Stat()
 	if err != nil {
-		_ = file.Close() // Guard against file descriptor leak
+		_ = file.Close()
 		return nil, err
 	}
-	offset := stat.Size()
-	// 3. Return initialized *DataFile
+
 	return &DataFile{
+		id:     id,
 		file:   file,
-		offset: offset,
+		offset: stat.Size(),
 	}, nil
+}
+
+// FileID returns the numeric identifier of the data file.
+func (df *DataFile) FileID() uint32 {
+	df.mu.RLock()
+	defer df.mu.RUnlock()
+	return df.id
 }
 
 // Write appends raw bytes to the end of the data file and returns the offset
