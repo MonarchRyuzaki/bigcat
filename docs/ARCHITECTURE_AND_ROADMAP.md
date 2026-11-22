@@ -128,6 +128,11 @@ type Item struct {
 - [ ] Active file (write-only append) vs Immutable older files (read-only).
 - [ ] Directory scanner and startup recovery (rebuilding `KeyDir` from all files in sequence).
 
+### Phase 2.5: High-Concurrency Write Optimizations (Group Commit & Lock Elision)
+- [ ] Pre-encode & compute CRC32 checksums outside the write mutex (fine-grained locking).
+- [ ] Group commit / write batching: aggregate concurrent client writes into batched disk flushes.
+- [ ] Re-benchmark high-concurrency `SET` throughput over TCP with `redis-benchmark -c 50`.
+
 ### Phase 3: Compaction / Merging & Hint Files
 - [ ] Background/manual `Merge()` to reclaim space from deleted/updated keys.
 - [ ] Generation of `.hint` files containing only index headers (`Timestamp | KeySize | ValueSize | RecordOffset | Key`).
