@@ -1,0 +1,155 @@
+package server
+
+import (
+	"bufio"
+	"net"
+	"strings"
+	"testing"
+
+	"bigcat"
+)
+
+func TestServer_CommandsOverTCP(t *testing.T) {
+	dir := t.TempDir()
+	db, err := bigcat.Open(dir)
+	if err != nil {
+		t.Fatalf("Open DB failed: %v", err)
+	}
+
+	// Listen on random port
+	srv := NewServer(db, "127.0.0.1:0")
+	go func() {
+		_ = srv.Start()
+	}()
+
+	// Wait for listener to be active
+	<-srv.Ready()
+	addr := srv.Addr()
+	if addr == nil {
+		t.Fatalf("server failed to bind address")
+	}
+
+	defer srv.Stop()
+
+	// Connect TCP client
+	conn, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatalf("failed to dial server: %v", err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+
+	// Helper to send line and read response
+	sendAndReceive := func(cmd string) string {
+		if _, err := conn.Write([]byte(cmd + "\r\n")); err != nil {
+			t.Fatalf("failed to write cmd %s: %v", cmd, err)
+		}
+		resp, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("failed to read response for cmd %s: %v", cmd, err)
+		}
+		return strings.TrimRight(resp, "\r\n")
+	}
+
+	// 1. PING & PING with message
+	if res := sendAndReceive("PING"); res != "+PONG" {
+		t.Errorf("expected +PONG, got %q", res)
+	}
+	if res := sendAndReceive("PING mymsg"); res != "$5" {
+		t.Errorf("expected bulk length $5 for PING mymsg, got %q", res)
+	}
+	echoPayload, _ := reader.ReadString('\n')
+	if strings.TrimRight(echoPayload, "\r\n") != "mymsg" {
+		t.Errorf("expected mymsg, got %q", echoPayload)
+	}
+
+	// 2. COMMAND handshake
+	if res := sendAndReceive("COMMAND"); res != "*0" {
+		t.Errorf("expected *0 for COMMAND, got %q", res)
+	}
+
+	// 3. SET
+	if res := sendAndReceive("SET hero batman"); res != "+OK" {
+		t.Errorf("expected +OK, got %q", res)
+	}
+
+	// 4. GET
+	if res := sendAndReceive("GET hero"); res != "$6" {
+		t.Errorf("expected length $6, got %q", res)
+	}
+	// Read payload
+	payload, _ := reader.ReadString('\n')
+	if strings.TrimRight(payload, "\r\n") != "batman" {
+		t.Errorf("expected batman, got %q", payload)
+	}
+
+	// 5. GET non-existent
+	if res := sendAndReceive("GET unknown"); res != "$-1" {
+		t.Errorf("expected $-1, got %q", res)
+	}
+
+	// 6. KEYS with pattern
+	if res := sendAndReceive("KEYS her*"); res != "*1" {
+		t.Errorf("expected array length *1, got %q", res)
+	}
+	keyLen, _ := reader.ReadString('\n')
+	keyPayload, _ := reader.ReadString('\n')
+	if strings.TrimRight(keyLen, "\r\n") != "$4" || strings.TrimRight(keyPayload, "\r\n") != "hero" {
+		t.Errorf("expected key hero, got %s / %s", keyLen, keyPayload)
+	}
+
+	// 7. Unknown command handling
+	if res := sendAndReceive("FOOBAR"); !strings.HasPrefix(res, "-ERR unknown command") {
+		t.Errorf("expected -ERR unknown command, got %q", res)
+	}
+
+	// 8. Multi-key DEL
+	_ = sendAndReceive("SET k1 v1")
+	_ = sendAndReceive("SET k2 v2")
+	if res := sendAndReceive("DEL hero k1 k2 missing"); res != ":3" {
+		t.Errorf("expected :3 deleted keys, got %q", res)
+	}
+
+	// 9. QUIT
+	if res := sendAndReceive("QUIT"); res != "+OK" {
+		t.Errorf("expected +OK on QUIT, got %q", res)
+	}
+}
+
+
+func BenchmarkServer_SetOverTCP(b *testing.B) {
+	dir := b.TempDir()
+	db, err := bigcat.Open(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	srv := NewServer(db, "127.0.0.1:0")
+	go func() {
+		_ = srv.Start()
+	}()
+	<-srv.Ready()
+	defer srv.Stop()
+
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	cmd := []byte("*3\r\n$3\r\nSET\r\n$4\r\nuser\r\n$5\r\nval12\r\n")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := conn.Write(cmd); err != nil {
+			b.Fatal(err)
+		}
+		resp, err := reader.ReadString('\n')
+		if err != nil || resp != "+OK\r\n" {
+			b.Fatalf("unexpected resp: %q, err: %v", resp, err)
+		}
+	}
+}
