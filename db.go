@@ -2,6 +2,7 @@ package bigcat
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,12 +16,13 @@ import (
 // DB represents a BigCat key-value storage engine instance.
 // It coordinates append-only multi-file storage on disk with an in-memory KeyDir index.
 type DB struct {
-	mu       sync.RWMutex
-	options  Options
-	storage  *storage.FileManager
-	index    index.Indexer
-	codec    record.Codec
-	isClosed bool
+	mu        sync.RWMutex
+	options   Options
+	storage   *storage.FileManager
+	index     index.Indexer
+	codec     record.Codec
+	committer *GroupCommitter
+	isClosed  bool
 }
 
 // Open initializes and opens a BigCat storage engine instance in the specified directory.
@@ -60,6 +62,9 @@ func Open(dirPath string, opts ...Option) (*DB, error) {
 		_ = idx.Close()
 		return nil, err
 	}
+
+	// 6. Start background group committer worker
+	db.committer = newGroupCommitter(db, DefaultMaxBatchSize, DefaultMaxBatchBytes)
 
 	return db, nil
 }
@@ -129,12 +134,19 @@ func (db *DB) scanDataFile(fileID uint32, file *os.File) error {
 }
 
 // Put writes a key-value pair to the database.
-// It serializes the record outside the lock, appends it to disk (rotating files if threshold is reached),
-// and updates the in-memory index with the file ID and record offset.
+// It serializes the record outside the lock and submits it to the group committer
+// for coalesced, low-latency disk commitment.
 func (db *DB) Put(key, value []byte) error {
 	if len(key) == 0 {
 		return ErrEmptyKey
 	}
+
+	db.mu.RLock()
+	if db.isClosed {
+		db.mu.RUnlock()
+		return ErrDatabaseClosed
+	}
+	db.mu.RUnlock()
 
 	// 1. Construct and encode record outside the mutex.
 	// Serialization and CRC32 calculation run in parallel across CPU cores with zero lock contention.
@@ -144,32 +156,19 @@ func (db *DB) Put(key, value []byte) error {
 		return err
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if db.isClosed {
-		return ErrDatabaseClosed
+	// 2. Submit write task to the group committer
+	task := &writeTask{
+		key:       key,
+		encoded:   encoded,
+		isDelete:  false,
+		timestamp: rec.Timestamp,
 	}
 
-	// 2. Append to disk log (FileManager handles rotation if maxFileSize is exceeded)
-	fileID, offset, err := db.storage.Write(encoded)
-	if err != nil {
-		return err
-	}
-
-	// 3. Update in-memory index with fileID, offset, and record size
-	db.index.Put(string(key), index.Item{
-		FileID:       fileID,
-		RecordOffset: offset,
-		RecordSize:   uint32(len(encoded)),
-		Timestamp:    rec.Timestamp,
-	})
-
-	// 4. Optionally flush to disk if SyncOnWrite is configured
-	if db.options.SyncOnWrite {
-		if err := db.storage.Sync(); err != nil {
-			return err
+	if err := db.committer.Submit(task); err != nil {
+		if errors.Is(err, ErrCommitterClosed) {
+			return ErrDatabaseClosed
 		}
+		return err
 	}
 
 	return nil
@@ -223,6 +222,18 @@ func (db *DB) Delete(key []byte) error {
 		return ErrEmptyKey
 	}
 
+	db.mu.RLock()
+	if db.isClosed {
+		db.mu.RUnlock()
+		return ErrDatabaseClosed
+	}
+	db.mu.RUnlock()
+
+	// Fast-path: Check if key currently exists in index before encoding or writing
+	if _, exists := db.index.Get(string(key)); !exists {
+		return ErrKeyNotFound
+	}
+
 	// 1. Construct and encode tombstone record outside the lock
 	tombstone := record.NewTombstone(key)
 	encoded, err := db.codec.Encode(tombstone)
@@ -230,31 +241,19 @@ func (db *DB) Delete(key []byte) error {
 		return err
 	}
 
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if db.isClosed {
-		return ErrDatabaseClosed
+	// 2. Submit tombstone task to the group committer
+	task := &writeTask{
+		key:       key,
+		encoded:   encoded,
+		isDelete:  true,
+		timestamp: tombstone.Timestamp,
 	}
 
-	// 2. Check if key currently exists
-	if _, exists := db.index.Get(string(key)); !exists {
-		return ErrKeyNotFound
-	}
-
-	// 3. Append tombstone record to disk
-	if _, _, err := db.storage.Write(encoded); err != nil {
-		return err
-	}
-
-	// 4. Evict key from in-memory index
-	db.index.Delete(string(key))
-
-	// 5. Optionally flush to disk
-	if db.options.SyncOnWrite {
-		if err := db.storage.Sync(); err != nil {
-			return err
+	if err := db.committer.Submit(task); err != nil {
+		if errors.Is(err, ErrCommitterClosed) {
+			return ErrDatabaseClosed
 		}
+		return err
 	}
 
 	return nil
@@ -284,6 +283,13 @@ func (db *DB) Sync() error {
 
 // Close flushes data to disk and closes all open data files and index.
 func (db *DB) Close() error {
+	// 1. Stop committer and drain any pending writes
+	if db.committer != nil {
+		if err := db.committer.Close(); err != nil {
+			return err
+		}
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -293,11 +299,11 @@ func (db *DB) Close() error {
 
 	db.isClosed = true
 
-	// Sync and close all data files via FileManager
+	// 2. Sync and close all data files via FileManager
 	if err := db.storage.Close(); err != nil {
 		return err
 	}
 
-	// Clear in-memory index
+	// 3. Clear in-memory index
 	return db.index.Close()
 }

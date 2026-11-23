@@ -26,20 +26,21 @@ BigCat is designed around the principles of **Bitcask** (Justin Sheehy & David S
                   ┌──────────────────────────────────────────────┐
                   │                 DB (Engine)                  │
                   │   - Open() / Close()                         │
-                  │   - Put(key, val)                            │
+                  │   - Put(key, val) / Delete(key)              │
                   │   - Get(key) -> val                          │
-                  │   - Delete(key)                              │
-                  └───────────────┬──────────────┬───────────────┘
-                                  │              │
-                   ┌──────────────▼───┐   ┌──────▼──────────────┐
-                   │     Indexer      │   │     FileManager     │
-                   │    (In-Memory)   │   │  (Active + Older)   │
-                   └──────────────────┘   └──────────────┬──────┘
-                                                         │
-                                                  ┌──────▼──────┐
-                                                  │    Codec    │
-                                                  │  (Binary)   │
-                                                  └─────────────┘
+                  └───────┬──────────────┬───────────────┬───────┘
+                          │              │               │
+           ┌──────────────▼───┐   ┌──────▼────────┐   ┌──▼───────────────┐
+           │     Indexer      │   │ GroupCommitter│   │   FileManager    │
+           │   (In-Memory)    │   │ (Batch Flush) │   │ (Active + Older) │
+           └──────────────────┘   └──────┬────────┘   └──────────┬───────┘
+                                         │                       │
+                                         └───────────┬───────────┘
+                                                     │
+                                              ┌──────▼──────┐
+                                              │    Codec    │
+                                              │  (Binary)   │
+                                              └─────────────┘
 ```
 
 ### Multi-File Directory Layout
@@ -70,13 +71,15 @@ All integers are encoded in **Little Endian**:
 
 Tested on an **AMD Ryzen 5 5600H (Linux x86_64)**:
 
-| Operation | Throughput | Latency | Memory Allocs |
+| Operation | Throughput | Latency | Concurrency / Notes |
 |---|---|---|---|
-| **Point Reads (`Get`)** | **~1,285,000 ops/sec** | `778.3 ns/op` | 3 allocs/op (144 B) |
-| **Appends (`Put`)** | **~574,000 ops/sec** | `1,742.0 ns/op` | 3 allocs/op (144 B) |
-| **Multi-File Reads (`ReadAt`)** | **~1,498,000 ops/sec** | `667.5 ns/op` | 1 alloc/op (128 B) |
+| **Durable Writes (`-sync=true`)** | **~13,245 ops/sec** | Sub-millisecond | **~53x speedup (+5,200%)** via adaptive Group Commit |
+| **Point Reads (`Get`)** | **~1,285,000 ops/sec** | `778.3 ns/op` | 3 allocs/op (144 B); 1-seek pread lookups |
+| **Appends (`Put` - Page Cache)** | **~574,000 ops/sec** | `1,742.0 ns/op` | Multi-core lock elision (zero mutex queueing) |
+| **Live TCP SET (`redis-benchmark`)** | **~76,277 req/sec** | `0.65 ms` | 50 concurrent TCP client connections |
+| **Live TCP GET (`redis-benchmark`)** | **~76,161 req/sec** | `0.65 ms` | 50 concurrent TCP client connections |
+| **Live TCP Pipelined GET (`-P 16`)** | **~550,505 req/sec** | `0.03 ms` | **>0.55 Million req/sec** over loopback TCP |
 | **In-Memory Index (`KeyDir`)** | **~81,900,000 ops/sec** | `12.2 ns/op` | **0 allocs/op (0 B)** |
-| **Live TCP Pipelined GET (`-P 16`)** | **~508,670 req/sec** | Sub-millisecond | High concurrency |
 
 👉 Full detailed benchmarks and methodology can be found in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
@@ -287,9 +290,12 @@ func main() {
   - [x] File rotation upon reaching size threshold (e.g. 64MB)
   - [x] Multiple immutable older files (`map[uint32]*DataFile`) + 1 active file
   - [x] Multi-file ordered startup recovery with tombstone replay
-- [ ] **Phase 2.5: High-Concurrency Write Optimizations**
-  - [ ] Lock elision: encoding and CRC32 outside database write mutex
-  - [ ] Group commit & write batching
+- [x] **Phase 2.5: High-Concurrency Write Optimizations**
+  - [x] Lock elision: encoding and CRC32 outside database write mutex
+  - [x] Group commit: coalesced sequential disk writes and hardware `fsync`
+- [ ] **Batch Write API & Redis MSET**
+  - [ ] Atomic `WriteBatch` API with in-memory transaction buffer
+  - [ ] Multi-key Redis `MSET` command over RESP
 - [ ] **Phase 3: Compaction / Merging & Hint Files**
   - [ ] Background garbage collection of overwritten/deleted records
   - [ ] `.hint` files for near-instant cold startups
