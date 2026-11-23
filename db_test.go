@@ -453,6 +453,29 @@ func BenchmarkDB_Put(b *testing.B) {
 	}
 }
 
+func BenchmarkDB_ParallelPut(b *testing.B) {
+	dir := b.TempDir()
+	db, err := Open(dir)
+	if err != nil {
+		b.Fatalf("Open failed: %v", err)
+	}
+	defer db.Close()
+
+	val := []byte("bench_parallel_value_payload")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		var i int
+		for pb.Next() {
+			i++
+			key := []byte(fmt.Sprintf("pkey_%d", i))
+			_ = db.Put(key, val)
+		}
+	})
+}
+
 func BenchmarkDB_Get(b *testing.B) {
 	dir := b.TempDir()
 	db, err := Open(dir)

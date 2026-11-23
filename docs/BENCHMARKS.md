@@ -114,3 +114,31 @@ Comprehensive comparison and architectural findings evaluating the transition fr
 | **Pipelined TCP GET** | `redis-benchmark -P 16` | ~186,100 req/sec | **~508,670 req/sec** | **>0.5 Million req/sec** over TCP; loopback network saturation |
 | **Reader Disruption During Rotation** | Concurrent reads during active file rotation | N/A | **0 errors / 0 dropped reads** | Existing file descriptor handles stay open; readers experience zero interruption |
 | **Cold Crash Recovery** | `KeyDir` rebuild on reboot | Single sequential scan | Ordered ascending scan (`00000` $\to$ `0000X`) | Replays all log segments in order; latest updates and tombstones overwrite stale keys |
+
+---
+
+## 7. Phase 2.5: High-Concurrency Write Optimizations (Part 1: Lock Elision)
+
+Evaluates the impact of moving record allocation, binary serialization, and CRC32 IEEE computation outside the database write mutex (`db.mu.Lock()`).
+
+### A. High-Throughput Mode (`-sync=false`, OS Page Cache)
+All 50 concurrent client goroutines encode records in parallel across CPU cores, eliminating mutex queueing delays:
+
+| Benchmark | Workload | Concurrency | Latency | Throughput | Impact / Findings |
+|---|---|---|---|---|---|
+| `BenchmarkDB_ParallelPut` | Multi-core In-Process | 12 threads | 2,165 ns/op | **~465,000 writes/sec** | Zero mutex convoying during record encoding & CRC calculation |
+| `Live TCP SET` | `redis-benchmark` | 50 clients | 0.65 ms | **~76,700 req/sec** | High-concurrency TCP throughput over loopback network |
+| `Live TCP GET` | `redis-benchmark` | 50 clients | 0.62 ms | **~80,100 req/sec** | Concurrent point reads across active and immutable files |
+| `Live TCP GET (Pipelined)` | `redis-benchmark -P 16` | 50 clients | 0.03 ms | **~487,000 req/sec** | Network packet batching nearing ~0.5M reads/sec |
+
+### B. Strict Durability Mode (`-sync=true`, Hardware `fsync`)
+When every write requires synchronous durability to stable media:
+
+| Benchmark | Workload | Concurrency | Hardware Latency | Throughput | The Physical Bottleneck |
+|---|---|---|---|---|---|
+| `Live TCP SET (Durable)` | `redis-benchmark` | 50 clients | ~4.0 - 5.5 ms per fsync | **~180 - 250 req/sec** | Hardware SSD flash controller sync latency |
+
+### C. Architectural Takeaway: The Rationale for Group Commit
+* **Lock Elision Success:** By eliminating CPU-bound serialization inside the lock, BigCat handles **~76.7k writes/sec** over TCP in page cache mode.
+* **The Hardware Bottleneck:** Under `-sync=true`, the ceiling is governed by NVMe/SSD physical flush latency (~4 ms per `fsync(2)`). Individually syncing 50 concurrent writes results in $50 \times 4\text{ms} = 200\text{ms}$ of serialized wait time, capping throughput to $1000\text{ms} / 4\text{ms} \approx 250 \text{ ops/sec}$.
+* **Next Step (Group Commit):** Batching concurrent writes into a shared flush queue allows 50 goroutines to share **one single `fsync(2)`**, reducing per-write latency to $4\text{ms} / 50 = 0.08\text{ms}$ and boosting durable throughput to $10,000+$ writes/sec.

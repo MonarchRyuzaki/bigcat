@@ -129,11 +129,19 @@ func (db *DB) scanDataFile(fileID uint32, file *os.File) error {
 }
 
 // Put writes a key-value pair to the database.
-// It serializes the record, appends it to disk (rotating files if threshold is reached),
+// It serializes the record outside the lock, appends it to disk (rotating files if threshold is reached),
 // and updates the in-memory index with the file ID and record offset.
 func (db *DB) Put(key, value []byte) error {
 	if len(key) == 0 {
 		return ErrEmptyKey
+	}
+
+	// 1. Construct and encode record outside the mutex.
+	// Serialization and CRC32 calculation run in parallel across CPU cores with zero lock contention.
+	rec := record.NewRecord(key, value)
+	encoded, err := db.codec.Encode(rec)
+	if err != nil {
+		return err
 	}
 
 	db.mu.Lock()
@@ -143,22 +151,13 @@ func (db *DB) Put(key, value []byte) error {
 		return ErrDatabaseClosed
 	}
 
-	// 1. Construct normal record
-	rec := record.NewRecord(key, value)
-
-	// 2. Encode record with Little Endian and CRC32
-	encoded, err := db.codec.Encode(rec)
-	if err != nil {
-		return err
-	}
-
-	// 3. Append to disk log (FileManager handles rotation if maxFileSize is exceeded)
+	// 2. Append to disk log (FileManager handles rotation if maxFileSize is exceeded)
 	fileID, offset, err := db.storage.Write(encoded)
 	if err != nil {
 		return err
 	}
 
-	// 4. Update in-memory index with fileID, offset, and record size
+	// 3. Update in-memory index with fileID, offset, and record size
 	db.index.Put(string(key), index.Item{
 		FileID:       fileID,
 		RecordOffset: offset,
@@ -166,7 +165,7 @@ func (db *DB) Put(key, value []byte) error {
 		Timestamp:    rec.Timestamp,
 	})
 
-	// 5. Optionally flush to disk if SyncOnWrite is configured
+	// 4. Optionally flush to disk if SyncOnWrite is configured
 	if db.options.SyncOnWrite {
 		if err := db.storage.Sync(); err != nil {
 			return err
@@ -224,6 +223,13 @@ func (db *DB) Delete(key []byte) error {
 		return ErrEmptyKey
 	}
 
+	// 1. Construct and encode tombstone record outside the lock
+	tombstone := record.NewTombstone(key)
+	encoded, err := db.codec.Encode(tombstone)
+	if err != nil {
+		return err
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -231,16 +237,9 @@ func (db *DB) Delete(key []byte) error {
 		return ErrDatabaseClosed
 	}
 
-	// 1. Check if key currently exists
+	// 2. Check if key currently exists
 	if _, exists := db.index.Get(string(key)); !exists {
 		return ErrKeyNotFound
-	}
-
-	// 2. Create and encode tombstone record
-	tombstone := record.NewTombstone(key)
-	encoded, err := db.codec.Encode(tombstone)
-	if err != nil {
-		return err
 	}
 
 	// 3. Append tombstone record to disk
