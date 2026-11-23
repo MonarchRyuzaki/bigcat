@@ -114,3 +114,34 @@ Comprehensive comparison and architectural findings evaluating the transition fr
 | **Pipelined TCP GET** | `redis-benchmark -P 16` | ~186,100 req/sec | **~508,670 req/sec** | **>0.5 Million req/sec** over TCP; loopback network saturation |
 | **Reader Disruption During Rotation** | Concurrent reads during active file rotation | N/A | **0 errors / 0 dropped reads** | Existing file descriptor handles stay open; readers experience zero interruption |
 | **Cold Crash Recovery** | `KeyDir` rebuild on reboot | Single sequential scan | Ordered ascending scan (`00000` $\to$ `0000X`) | Replays all log segments in order; latest updates and tombstones overwrite stale keys |
+
+---
+
+## 7. Phase 2.5: High-Concurrency Write Optimizations (Lock Elision & Group Commit)
+
+Evaluates the two-stage write path optimization:
+1. **Part 1 (Lock Elision):** Moving record serialization and CRC32 IEEE computation outside `db.mu.Lock()`.
+2. **Part 2 (Group Commit):** Adaptive batching of concurrent writes via `GroupCommitter` to coalesce multiple writes and physical `fsync(2)` flushes into a single I/O operation.
+
+### A. High-Throughput Mode (`-sync=false`, OS Page Cache)
+Records are encoded in parallel across multi-core CPU threads, with zero-latency opportunistic draining on the group committer:
+
+| Benchmark | Workload | Concurrency | Latency | Throughput | Impact / Findings |
+|---|---|---|---|---|---|
+| `BenchmarkDB_ParallelPut` | Multi-core In-Process | 12 threads | 2,399 ns/op | **~416,840 writes/sec** | Zero mutex convoying during record encoding & CRC calculation |
+| `Live TCP SET` | `redis-benchmark` | 50 clients | 0.65 ms | **~76,277 req/sec** | High-concurrency TCP throughput over loopback network |
+| `Live TCP GET` | `redis-benchmark` | 50 clients | 0.65 ms | **~76,161 req/sec** | Concurrent point reads across active and immutable files |
+| `Live TCP GET (Pipelined)` | `redis-benchmark -P 16` | 50 clients | 0.03 ms | **~550,505 req/sec** | Network packet batching exceeding **0.55 Million reads/sec** |
+
+### B. Strict Durability Mode (`-sync=true`, Hardware `fsync`)
+Comparing individual `fsync(2)` per write versus coalesced Group Commit under 50 concurrent client connections:
+
+| Mode | Concurrency | `fsync` Strategy | Average Throughput | Speedup | Latency Profile |
+|---|---|---|---|---|---|
+| **Before Group Commit** | 50 clients | 1 `fsync` per write | **~180 – 250 req/sec** | Baseline | Constrained by ~4ms physical SSD flash latency |
+| **With Group Commit** | 50 clients | Coalesced batch `fsync` | **~12,680 – 13,245 req/sec** | **~53x (~5,200%)** | 50 writes share 1 single hardware sync (~0.08ms/write) |
+
+### C. Architectural Takeaway: Why Group Commit Works
+1. **The Physical Wall:** Physical SSD/NVMe flash controllers require ~4 ms to commit dirty blocks from volatile controller cache to non-volatile NAND cells. Serializing 50 independent `fsync(2)` calls took $50 \times 4\text{ms} = 200\text{ms}$.
+2. **Adaptive Coalescing:** `GroupCommitter` introduces zero artificial latency timers (`linger.ms = 0`). Under 1 client, it flushes immediately in ~0.05ms. Under 50 concurrent clients, writes naturally queue while the previous batch writes to disk, automatically coalescing all pending writes into a single disk write and single `fsync(2)`.
+3. **Double Guardrails:** The batch flush is capped by both item count (`maxBatchSize = 128`) and memory buffer size (`maxBatchBytes = 4MB`), preventing oversized memory allocations while keeping the write pipeline continuously saturated.
