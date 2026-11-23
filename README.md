@@ -299,6 +299,12 @@ func main() {
 - [ ] **Phase 3: Compaction / Merging & Hint Files**
   - [ ] Background garbage collection of overwritten/deleted records
   - [ ] `.hint` files for near-instant cold startups
-- [ ] **Phase 4: Distributed BigCat**
+- [ ] **Phase 4: Pluggable Storage Engine Architecture (Dual-Paradigm)**
+  - [ ] Abstract `Engine` interface decoupling the RESP server from underlying storage backends
+  - [ ] Engine selection flag: `-engine=bitcask` (append-only log) vs `-engine=ryudb` (4KB B-Tree)
+  - [ ] RyuDB Engine integration: 4KB disk pages, Buffer Pool Manager, WAL, and ARIES recovery
+  - [ ] Redis ACID Transactions: Wire Redis `MULTI` / `EXEC` / `DISCARD` directly to RyuDB's MVCC & transaction manager
+- [ ] **Phase 5: Distributed BigCat (Consensus & High Availability)**
   - [ ] Docker containerization
-  - [ ] Raft consensus & replicated state machine
+  - [ ] Raft consensus & replicated state machine across multi-node clusters
+  - [ ] Automated leader election, log replication, and zero-loss failover
