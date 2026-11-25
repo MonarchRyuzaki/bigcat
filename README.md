@@ -27,7 +27,7 @@ BigCat is designed around the principles of **Bitcask** (Justin Sheehy & David S
                   │                 DB (Engine)                  │
                   │   - Open() / Close()                         │
                   │   - Put(key, val) / Delete(key)              │
-                  │   - Get(key) -> val                          │
+                  │   - WriteBatch(batch) / Get(key) -> val      │
                   └───────┬──────────────┬───────────────┬───────┘
                           │              │               │
            ┌──────────────▼───┐   ┌──────▼────────┐   ┌──▼───────────────┐
@@ -73,9 +73,12 @@ Tested on an **AMD Ryzen 5 5600H (Linux x86_64)**:
 
 | Operation | Throughput | Latency | Concurrency / Notes |
 |---|---|---|---|
+| **Atomic Batch (`WriteBatch` 100 keys)** | **~1,029,300 keys/sec** | `972 ns/key` | Single sequential write + in-batch key deduplication |
 | **Durable Writes (`-sync=true`)** | **~13,245 ops/sec** | Sub-millisecond | **~53x speedup (+5,200%)** via adaptive Group Commit |
+| **Durable `MSET` (`-sync=true`, 10 keys)** | **~8,382 req/sec** | **~83.8k keys/sec** | Coalesced `fsync` across concurrent batch writers |
 | **Point Reads (`Get`)** | **~1,285,000 ops/sec** | `778.3 ns/op` | 3 allocs/op (144 B); 1-seek pread lookups |
 | **Appends (`Put` - Page Cache)** | **~574,000 ops/sec** | `1,742.0 ns/op` | Multi-core lock elision (zero mutex queueing) |
+| **Live TCP `MSET` (`-sync=false`, 10 keys)** | **~64,350 req/sec** | **~643.5k keys/sec** | 50 concurrent TCP client connections |
 | **Live TCP SET (`redis-benchmark`)** | **~76,277 req/sec** | `0.65 ms` | 50 concurrent TCP client connections |
 | **Live TCP GET (`redis-benchmark`)** | **~76,161 req/sec** | `0.65 ms` | 50 concurrent TCP client connections |
 | **Live TCP Pipelined GET (`-P 16`)** | **~550,505 req/sec** | `0.03 ms` | **>0.55 Million req/sec** over loopback TCP |
@@ -166,13 +169,20 @@ OK
 127.0.0.1:6380> SET user:101 "Bob"
 OK
 
+127.0.0.1:6380> MSET user:102 "Charlie" user:103 "Diana"
+OK
+
 127.0.0.1:6380> KEYS *
 1) "user:100"
 2) "user:101"
+3) "user:102"
+4) "user:103"
 
 127.0.0.1:6380> KEYS user:10*
 1) "user:100"
 2) "user:101"
+3) "user:102"
+4) "user:103"
 
 127.0.0.1:6380> DEL user:100
 (integer) 1
@@ -197,8 +207,8 @@ redis-benchmark -p 6380 -t get -n 50000 -q
 # 2. Benchmark pipelined point reads (16 commands per batch):
 redis-benchmark -p 6380 -t get -n 100000 -P 16 -q
 
-# 3. Benchmark concurrent appends (SET):
-redis-benchmark -p 6380 -t set -n 50000 -q
+# 3. Benchmark concurrent appends (SET) and atomic batches (MSET):
+redis-benchmark -p 6380 -t set,mset -n 50000 -q
 ```
 
 ---
@@ -265,8 +275,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// 5. Delete key-value pair (appends tombstone)
-	if err := db.Delete([]byte("hero")); err != nil {
+	// 5. Atomic multi-key batch (Put + Delete committed together)
+	batch := bigcat.NewWriteBatch()
+	_ = batch.Put([]byte("sidekick"), []byte("robin"))
+	_ = batch.Delete([]byte("hero"))
+	if err := db.WriteBatch(batch); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -284,7 +297,7 @@ func main() {
   - [x] Comprehensive test suite & benchmarks
 - [x] **RESP Protocol Server & CLI**
   - [x] RESP v2 parser and serializer (`internal/resp`)
-  - [x] TCP command dispatcher (`PING`, `SET`, `GET`, `DEL`, `KEYS`, `COMMAND`, `QUIT`)
+  - [x] TCP command dispatcher (`PING`, `SET`, `MSET`, `GET`, `DEL`, `KEYS`, `COMMAND`, `QUIT`)
   - [x] Full compatibility with `redis-cli` and `redis-benchmark`
 - [x] **Phase 2: Multi-File Rotation & Directory Management**
   - [x] File rotation upon reaching size threshold (e.g. 64MB)
@@ -293,9 +306,9 @@ func main() {
 - [x] **Phase 2.5: High-Concurrency Write Optimizations**
   - [x] Lock elision: encoding and CRC32 outside database write mutex
   - [x] Group commit: coalesced sequential disk writes and hardware `fsync`
-- [ ] **Batch Write API & Redis MSET**
-  - [ ] Atomic `WriteBatch` API with in-memory transaction buffer
-  - [ ] Multi-key Redis `MSET` command over RESP
+- [x] **Batch Write API & Redis MSET**
+  - [x] Atomic `WriteBatch` API with in-memory deduplicating buffer
+  - [x] Multi-key Redis `MSET` command over RESP
 - [ ] **Phase 3: Compaction / Merging & Hint Files**
   - [ ] Background garbage collection of overwritten/deleted records
   - [ ] `.hint` files for near-instant cold startups

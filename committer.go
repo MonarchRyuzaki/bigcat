@@ -13,7 +13,7 @@ var (
 )
 
 const (
-	// DefaultMaxBatchSize is the maximum number of writes to coalesce into a single disk write.
+	// DefaultMaxBatchSize is the maximum number of operations to coalesce into a single disk write.
 	DefaultMaxBatchSize = 128
 
 	// DefaultMaxBatchBytes is the maximum total payload size (4MB) to coalesce into a single disk write.
@@ -23,14 +23,28 @@ const (
 	DefaultBatchQueueCapacity = 1024
 )
 
-// writeTask represents a single write (Put or Delete) queued for group commitment.
-type writeTask struct {
+// writeEntry represents a single encoded Put or Delete mutation.
+type writeEntry struct {
 	key       []byte
 	encoded   []byte
 	isDelete  bool
 	timestamp uint64
-	err       error
-	done      chan struct{}
+}
+
+// writeTask represents a single write (Put, Delete, or atomic WriteBatch) queued for group commitment.
+// All entries inside a single writeTask are guaranteed to be committed together atomically.
+type writeTask struct {
+	entries []writeEntry
+	err     error
+	done    chan struct{}
+}
+
+func (t *writeTask) totalBytes() int {
+	total := 0
+	for _, e := range t.entries {
+		total += len(e.encoded)
+	}
+	return total
 }
 
 // GroupCommitter coalesces concurrent write requests from multiple goroutines into
@@ -99,18 +113,20 @@ func (gc *GroupCommitter) workerLoop() {
 	for task := range gc.queue {
 		batch := make([]*writeTask, 0, gc.maxBatchSize)
 		batch = append(batch, task)
-		batchBytes := len(task.encoded)
+		batchOps := len(task.entries)
+		batchBytes := task.totalBytes()
 
 		// Greedily drain any other tasks currently waiting in queue up to maxBatchSize or maxBatchBytes
 	drain:
-		for len(batch) < gc.maxBatchSize && batchBytes < gc.maxBatchBytes {
+		for batchOps < gc.maxBatchSize && batchBytes < gc.maxBatchBytes {
 			select {
 			case nextTask, ok := <-gc.queue:
 				if !ok {
 					break drain
 				}
 				batch = append(batch, nextTask)
-				batchBytes += len(nextTask.encoded)
+				batchOps += len(nextTask.entries)
+				batchBytes += nextTask.totalBytes()
 			default:
 				break drain
 			}
@@ -127,16 +143,25 @@ func (gc *GroupCommitter) flushBatch(batch []*writeTask) {
 		return
 	}
 
-	// 1. Calculate total length of all encoded payloads in the batch
+	// 1. Calculate total payload size across all tasks outside the DB lock
 	totalBytes := 0
-	for _, item := range batch {
-		totalBytes += len(item.encoded)
+	for _, task := range batch {
+		totalBytes += task.totalBytes()
 	}
 
-	// 2. Pre-allocate combined buffer and coalesce all encoded records
+	if totalBytes == 0 {
+		for _, task := range batch {
+			close(task.done)
+		}
+		return
+	}
+
+	// 2. Assemble contiguous write buffer outside the DB lock
 	buffer := make([]byte, 0, totalBytes)
-	for _, item := range batch {
-		buffer = append(buffer, item.encoded...)
+	for _, task := range batch {
+		for _, entry := range task.entries {
+			buffer = append(buffer, entry.encoded...)
+		}
 	}
 
 	// 3. Acquire database lock to serialize disk append and index updates
@@ -150,7 +175,7 @@ func (gc *GroupCommitter) flushBatch(batch []*writeTask) {
 		return
 	}
 
-	// 4. Single sequential write to active data file
+	// 4. Single sequential write to active data file (blind append)
 	fileID, startOffset, err := gc.db.storage.Write(buffer)
 
 	// 5. If SyncOnWrite is configured, issue ONE physical sync for the entire batch
@@ -158,21 +183,23 @@ func (gc *GroupCommitter) flushBatch(batch []*writeTask) {
 		err = gc.db.storage.Sync()
 	}
 
-	// 6. Update index for each task while holding db.mu
+	// 6. Update index for each entry while holding db.mu
 	if err == nil {
 		currOffset := startOffset
 		for _, task := range batch {
-			if task.isDelete {
-				gc.db.index.Delete(string(task.key))
-			} else {
-				gc.db.index.Put(string(task.key), index.Item{
-					FileID:       fileID,
-					RecordOffset: currOffset,
-					RecordSize:   uint32(len(task.encoded)),
-					Timestamp:    task.timestamp,
-				})
+			for _, entry := range task.entries {
+				if entry.isDelete {
+					gc.db.index.Delete(string(entry.key))
+				} else {
+					gc.db.index.Put(string(entry.key), index.Item{
+						FileID:       fileID,
+						RecordOffset: currOffset,
+						RecordSize:   uint32(len(entry.encoded)),
+						Timestamp:    entry.timestamp,
+					})
+				}
+				currOffset += int64(len(entry.encoded))
 			}
-			currOffset += int64(len(task.encoded))
 		}
 	}
 	gc.db.mu.Unlock()

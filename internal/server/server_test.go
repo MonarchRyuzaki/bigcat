@@ -104,14 +104,32 @@ func TestServer_CommandsOverTCP(t *testing.T) {
 		t.Errorf("expected -ERR unknown command, got %q", res)
 	}
 
-	// 8. Multi-key DEL
-	_ = sendAndReceive("SET k1 v1")
-	_ = sendAndReceive("SET k2 v2")
-	if res := sendAndReceive("DEL hero k1 k2 missing"); res != ":3" {
-		t.Errorf("expected :3 deleted keys, got %q", res)
+	// 8. Multi-key MSET & argument validation
+	if res := sendAndReceive("MSET"); !strings.HasPrefix(res, "-ERR wrong number of arguments") {
+		t.Errorf("expected wrong number of arguments for MSET, got %q", res)
+	}
+	if res := sendAndReceive("MSET k1 v1 k2"); !strings.HasPrefix(res, "-ERR wrong number of arguments") {
+		t.Errorf("expected wrong number of arguments for odd MSET, got %q", res)
+	}
+	if res := sendAndReceive("MSET m1 mv1 m2 mv2"); res != "+OK" {
+		t.Errorf("expected +OK for MSET, got %q", res)
+	}
+	if res := sendAndReceive("GET m2"); res != "$3" {
+		t.Errorf("expected $3 for GET m2, got %q", res)
+	}
+	m2Payload, _ := reader.ReadString('\n')
+	if strings.TrimRight(m2Payload, "\r\n") != "mv2" {
+		t.Errorf("expected mv2, got %q", m2Payload)
 	}
 
-	// 9. QUIT
+	// 9. Multi-key DEL
+	_ = sendAndReceive("SET k1 v1")
+	_ = sendAndReceive("SET k2 v2")
+	if res := sendAndReceive("DEL hero k1 k2 m1 m2 missing"); res != ":5" {
+		t.Errorf("expected :5 deleted keys, got %q", res)
+	}
+
+	// 10. QUIT
 	if res := sendAndReceive("QUIT"); res != "+OK" {
 		t.Errorf("expected +OK on QUIT, got %q", res)
 	}

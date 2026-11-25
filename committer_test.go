@@ -28,10 +28,12 @@ func TestGroupCommitter_SingleTask(t *testing.T) {
 	}
 
 	task := &writeTask{
-		key:       key,
-		encoded:   encoded,
-		isDelete:  false,
-		timestamp: rec.Timestamp,
+		entries: []writeEntry{{
+			key:       key,
+			encoded:   encoded,
+			isDelete:  false,
+			timestamp: rec.Timestamp,
+		}},
 	}
 
 	if err := gc.Submit(task); err != nil {
@@ -75,10 +77,12 @@ func TestGroupCommitter_ConcurrentBatch(t *testing.T) {
 			}
 
 			task := &writeTask{
-				key:       key,
-				encoded:   encoded,
-				isDelete:  false,
-				timestamp: rec.Timestamp,
+				entries: []writeEntry{{
+					key:       key,
+					encoded:   encoded,
+					isDelete:  false,
+					timestamp: rec.Timestamp,
+				}},
 			}
 
 			if err := gc.Submit(task); err != nil {
@@ -118,8 +122,10 @@ func TestGroupCommitter_CloseAndDrain(t *testing.T) {
 
 	// Submitting to closed committer should return ErrCommitterClosed
 	task := &writeTask{
-		key:     []byte("k"),
-		encoded: []byte("v"),
+		entries: []writeEntry{{
+			key:     []byte("k"),
+			encoded: []byte("v"),
+		}},
 	}
 	err = gc.Submit(task)
 	if err != ErrCommitterClosed {
@@ -150,9 +156,11 @@ func TestGroupCommitter_MaxBatchBytes(t *testing.T) {
 		}
 
 		task := &writeTask{
-			key:       key,
-			encoded:   encoded,
-			timestamp: rec.Timestamp,
+			entries: []writeEntry{{
+				key:       key,
+				encoded:   encoded,
+				timestamp: rec.Timestamp,
+			}},
 		}
 		if err := gc.Submit(task); err != nil {
 			t.Fatalf("submit failed: %v", err)
@@ -165,5 +173,49 @@ func TestGroupCommitter_MaxBatchBytes(t *testing.T) {
 		if string(got) != string(val) {
 			t.Fatalf("expected %s, got %s", val, got)
 		}
+	}
+}
+
+func TestGroupCommitter_MultiEntryTask(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	recA := record.NewRecord([]byte("a"), []byte("1"))
+	encA, _ := db.codec.Encode(recA)
+
+	recB := record.NewRecord([]byte("b"), []byte("2"))
+	encB, _ := db.codec.Encode(recB)
+
+	delA := record.NewTombstone([]byte("a"))
+	encDelA, _ := db.codec.Encode(delA)
+
+	task := &writeTask{
+		entries: []writeEntry{
+			{key: []byte("a"), encoded: encA, timestamp: recA.Timestamp},
+			{key: []byte("b"), encoded: encB, timestamp: recB.Timestamp},
+			{key: []byte("a"), encoded: encDelA, isDelete: true, timestamp: delA.Timestamp},
+		},
+	}
+
+	if err := db.committer.Submit(task); err != nil {
+		t.Fatalf("submit failed: %v", err)
+	}
+
+	// "b" should exist, "a" should be deleted
+	gotB, err := db.Get([]byte("b"))
+	if err != nil || string(gotB) != "2" {
+		t.Fatalf("expected b='2', got %q (err=%v)", gotB, err)
+	}
+	if _, err := db.Get([]byte("a")); err != ErrKeyNotFound {
+		t.Fatalf("expected ErrKeyNotFound for a, got %v", err)
+	}
+
+	expectedBytes := int64(len(encA) + len(encB) + len(encDelA))
+	if gotSize := db.storage.ActiveFile().Size(); gotSize != expectedBytes {
+		t.Fatalf("expected disk size %d, got %d", expectedBytes, gotSize)
 	}
 }
