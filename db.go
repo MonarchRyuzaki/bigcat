@@ -157,21 +157,12 @@ func (db *DB) Put(key, value []byte) error {
 	}
 
 	// 2. Submit write task to the group committer
-	task := &writeTask{
+	return db.submitEntries([]writeEntry{{
 		key:       key,
 		encoded:   encoded,
 		isDelete:  false,
 		timestamp: rec.Timestamp,
-	}
-
-	if err := db.committer.Submit(task); err != nil {
-		if errors.Is(err, ErrCommitterClosed) {
-			return ErrDatabaseClosed
-		}
-		return err
-	}
-
-	return nil
+	}})
 }
 
 // Get retrieves the value for the given key.
@@ -242,20 +233,62 @@ func (db *DB) Delete(key []byte) error {
 	}
 
 	// 2. Submit tombstone task to the group committer
-	task := &writeTask{
+	return db.submitEntries([]writeEntry{{
 		key:       key,
 		encoded:   encoded,
 		isDelete:  true,
 		timestamp: tombstone.Timestamp,
+	}})
+}
+
+// WriteBatch atomically commits all staged Put and Delete operations in the batch.
+func (db *DB) WriteBatch(batch *WriteBatch) error {
+	if batch == nil || batch.Size() == 0 {
+		return nil
 	}
 
-	if err := db.committer.Submit(task); err != nil {
+	db.mu.RLock()
+	if db.isClosed {
+		db.mu.RUnlock()
+		return ErrDatabaseClosed
+	}
+	db.mu.RUnlock()
+
+	// 1. Construct and encode all staged records outside the write lock
+	entries := make([]writeEntry, 0, len(batch.ops))
+	for _, op := range batch.ops {
+		var rec *record.Record
+		if op.isDelete {
+			rec = record.NewTombstone(op.key)
+		} else {
+			rec = record.NewRecord(op.key, op.value)
+		}
+
+		encoded, err := db.codec.Encode(rec)
+		if err != nil {
+			return err
+		}
+
+		entries = append(entries, writeEntry{
+			key:       op.key,
+			encoded:   encoded,
+			isDelete:  op.isDelete,
+			timestamp: rec.Timestamp,
+		})
+	}
+
+	// 2. Submit as an indivisible unit so the entire batch commits atomically
+	// and shares GroupCommitter fsync coalescing.
+	return db.submitEntries(entries)
+}
+
+func (db *DB) submitEntries(entries []writeEntry) error {
+	if err := db.committer.Submit(&writeTask{entries: entries}); err != nil {
 		if errors.Is(err, ErrCommitterClosed) {
 			return ErrDatabaseClosed
 		}
 		return err
 	}
-
 	return nil
 }
 

@@ -145,3 +145,27 @@ Comparing individual `fsync(2)` per write versus coalesced Group Commit under 50
 1. **The Physical Wall:** Physical SSD/NVMe flash controllers require ~4 ms to commit dirty blocks from volatile controller cache to non-volatile NAND cells. Serializing 50 independent `fsync(2)` calls took $50 \times 4\text{ms} = 200\text{ms}$.
 2. **Adaptive Coalescing:** `GroupCommitter` introduces zero artificial latency timers (`linger.ms = 0`). Under 1 client, it flushes immediately in ~0.05ms. Under 50 concurrent clients, writes naturally queue while the previous batch writes to disk, automatically coalescing all pending writes into a single disk write and single `fsync(2)`.
 3. **Double Guardrails:** The batch flush is capped by both item count (`maxBatchSize = 128`) and memory buffer size (`maxBatchBytes = 4MB`), preventing oversized memory allocations while keeping the write pipeline continuously saturated.
+
+---
+
+## 8. Explicit Atomic `WriteBatch` & Redis `MSET` Benchmarks
+
+Evaluates application-level atomic batch writes (`WriteBatch` with in-batch key deduplication and `GroupCommitter` coalescing) both in-process and over live TCP (`MSET`).
+
+### A. In-Process `WriteBatch` Throughput (`go test -bench=BenchmarkDB -benchmem .`)
+
+| Benchmark | Workload | Latency / Batch | Amortized Per Key | Effective Throughput |
+|---|---|---|---|---|
+| `BenchmarkDB_WriteBatch10` | 10 keys/batch (sequential) | 9,792 ns/op | **~979 ns/key** | **~1,021,200 keys/sec** (~124k batches/sec) |
+| `BenchmarkDB_WriteBatch100` | 100 keys/batch (sequential) | 97,154 ns/op | **~972 ns/key** | **~1,029,300 keys/sec** (~10.3k batches/sec) |
+| `BenchmarkDB_ParallelWriteBatch10` | 10 keys/batch (12 threads) | 11,415 ns/op | **~1,142 ns/key** | **~876,000 keys/sec** (~87.6k batches/sec) |
+| `BenchmarkDB_Put` *(baseline)* | 1 key/op (sequential) | 3,046 ns/op | 3,046 ns/key | ~328,300 keys/sec |
+
+* **Key Finding:** Batching 10–100 mutations into an atomic `WriteBatch` cuts per-key commit overhead by **~3.1x** compared to individual `Put` calls, pushing sequential embedded ingestion past **1 Million keys/sec**.
+
+### B. Live TCP `MSET` (`redis-benchmark`, 50 Concurrent Clients, 10 Keys/Request)
+
+| Mode | Command | Request Rate | Key Ingestion Rate | Notes |
+|---|---|---|---|---|
+| **Page Cache (`-sync=false`)** | `MSET` (10 keys) | **~64,350 req/sec** | **~643,500 keys/sec** | Atomic 10-key commit over loopback TCP (`SET`: ~67.2k req/sec, `GET`: ~73.7k req/sec) |
+| **Strict Durability (`-sync=true`)** | `MSET` (10 keys) | **~8,382 req/sec** | **~83,822 keys/sec** | Concurrent `MSET` batches share GroupCommitter's `fsync(2)` flush |

@@ -160,6 +160,28 @@ func (s *Server) handleConnection(conn net.Conn) {
 				}
 			}
 
+		case "MSET":
+			if len(cmd) < 3 || (len(cmd)-1)%2 != 0 {
+				_ = writer.WriteError("wrong number of arguments for 'mset' command")
+			} else {
+				batch := bigcat.NewWriteBatch()
+				var batchErr error
+				for i := 1; i < len(cmd); i += 2 {
+					if err := batch.Put(cmd[i], cmd[i+1]); err != nil {
+						batchErr = err
+						break
+					}
+				}
+
+				if batchErr != nil {
+					_ = writer.WriteError(batchErr.Error())
+				} else if err := s.db.WriteBatch(batch); err != nil {
+					_ = writer.WriteError(err.Error())
+				} else {
+					_ = writer.WriteSimpleString("OK")
+				}
+			}
+
 		case "GET":
 			if len(cmd) != 2 {
 				_ = writer.WriteError("wrong number of arguments for 'get' command")
