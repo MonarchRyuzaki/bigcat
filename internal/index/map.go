@@ -24,6 +24,19 @@ func (m *MapIndex) Put(key string, item Item) {
 	m.items[key] = item
 }
 
+// CompareAndSwap updates key to updated only if key currently exists in m.items
+// and matches expected.FileID and expected.RecordOffset.
+func (m *MapIndex) CompareAndSwap(key string, expected, updated Item) bool {
+	// TODO(compaction):
+	// 1. Acquire m.mu.Lock() and defer m.mu.Unlock().
+	// 2. Guard against nil m.items (after Close).
+	// 3. Look up cur, ok := m.items[key]. If !ok, return false (key was concurrently deleted).
+	// 4. If cur.FileID != expected.FileID || cur.RecordOffset != expected.RecordOffset, return false
+	//    (key was concurrently overwritten in the active file while compaction was copying).
+	// 5. Set m.items[key] = updated and return true.
+	return false
+}
+
 // Get finds an index entry for the given key.
 func (m *MapIndex) Get(key string) (Item, bool) {
 	m.mu.RLock()

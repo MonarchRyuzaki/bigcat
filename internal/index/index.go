@@ -24,6 +24,11 @@ type Indexer interface {
 	// Put inserts or updates the index item for the given key.
 	Put(key string, item Item)
 
+	// CompareAndSwap atomically updates key to updated only if key currently exists
+	// and points to the exact same FileID and RecordOffset as expected.
+	// Used during compaction Phase 4 so stale relocations never overwrite concurrent writes/deletes.
+	CompareAndSwap(key string, expected, updated Item) bool
+
 	// Get retrieves the index item for a given key. Returns false if not found.
 	Get(key string) (Item, bool)
 

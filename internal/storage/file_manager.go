@@ -236,6 +236,46 @@ func (fm *FileManager) ActiveFile() *DataFile {
 	return fm.activeFile
 }
 
+// SealedSnapshot atomically returns all sealed (olderFiles) IDs sorted in ascending order,
+// along with the current activeFile ID at the moment of the snapshot.
+// Compaction uses this in Phase 1 to freeze the set of files to merge and enforce dstID < activeID.
+func (fm *FileManager) SealedSnapshot() (sealedIDs []uint32, activeID uint32) {
+	// TODO(compaction):
+	// 1. Acquire fm.mu.RLock() and defer fm.mu.RUnlock().
+	// 2. Read activeID (0 if fm.activeFile == nil).
+	// 3. Collect all keys from fm.olderFiles into sealedIDs and sort ascending with slices.Sort.
+	// 4. Return sealedIDs, activeID.
+	return nil, 0
+}
+
+// CloseAndDeleteOlderFiles detaches and closes the DataFile handles for fileIDs from olderFiles,
+// and unlinks their corresponding .data files from fm.dirPath.
+// Called during compaction Phase 4 under DB lock before moving compacted files out of .tmp/.
+func (fm *FileManager) CloseAndDeleteOlderFiles(fileIDs []uint32) error {
+	// TODO(compaction):
+	// 1. Acquire fm.mu.Lock() and defer fm.mu.Unlock().
+	// 2. For each id in fileIDs:
+	//    a. If df, ok := fm.olderFiles[id]; ok -> delete(fm.olderFiles, id) and close df (df.Close()).
+	//    b. Remove the file on disk: os.Remove(filepath.Join(fm.dirPath, DataFileName(id)))
+	//       (ignore os.ErrNotExist if already removed, return any other error).
+	// 3. Return nil on success.
+	return nil
+}
+
+// AdoptOlderFiles opens already-moved compacted .data files in fm.dirPath in read-only mode
+// and registers them into fm.olderFiles.
+// Called during compaction Phase 4 right after renaming compacted files from .tmp/ into fm.dirPath.
+func (fm *FileManager) AdoptOlderFiles(fileIDs []uint32) error {
+	// TODO(compaction):
+	// 1. Acquire fm.mu.Lock() and defer fm.mu.Unlock().
+	// 2. For each id in fileIDs:
+	//    a. Build path := filepath.Join(fm.dirPath, DataFileName(id)).
+	//    b. Open read-only via OpenDataFileWithMode(path, id, true).
+	//    c. Store fm.olderFiles[id] = df.
+	// 3. If an error occurs midway, close any files opened during this call before returning the error.
+	return nil
+}
+
 // FileIDs returns all data file IDs currently managed (both older and active),
 // sorted in ascending order.
 func (fm *FileManager) FileIDs() []uint32 {
