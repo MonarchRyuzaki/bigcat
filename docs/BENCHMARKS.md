@@ -169,3 +169,18 @@ Evaluates application-level atomic batch writes (`WriteBatch` with in-batch key 
 |---|---|---|---|---|
 | **Page Cache (`-sync=false`)** | `MSET` (10 keys) | **~64,350 req/sec** | **~643,500 keys/sec** | Atomic 10-key commit over loopback TCP (`SET`: ~67.2k req/sec, `GET`: ~73.7k req/sec) |
 | **Strict Durability (`-sync=true`)** | `MSET` (10 keys) | **~8,382 req/sec** | **~83,822 keys/sec** | Concurrent `MSET` batches share GroupCommitter's `fsync(2)` flush |
+
+---
+
+## 9. Durable Default (`SyncOnWrite: true`) Benchmarks (`go test -bench=BenchmarkDB -benchmem -benchtime=500ms -run=^$ .`)
+
+Measured after changing `DefaultOptions` in `options.go` to `SyncOnWrite: true` (physical `fsync(2)` per GroupCommitter batch; `WithSyncOnWrite(false)` remains available for page-cache throughput):
+
+| Benchmark | Iterations | Latency | Memory / Op | Allocs / Op | Notes |
+|---|---|---|---|---|---|
+| `BenchmarkDB_Put-12` | 170 | **3,430,784 ns/op** (~3.43 ms) | 1,587 B/op | 8 allocs/op | Sequential durable `Put` (~291 ops/sec, 1 `fsync`/op) |
+| `BenchmarkDB_ParallelPut-12` | 699 | **924,926 ns/op** (~0.92 ms) | 754 B/op | 8 allocs/op | 12-thread GroupCommitter coalesced `fsync` (~1,081 ops/sec) |
+| `BenchmarkDB_WriteBatch10-12` | 158 | **3,394,878 ns/op** (~3.39 ms) | 4,750 B/op | 65 allocs/op | 10 keys/batch (~2,945 keys/sec) |
+| `BenchmarkDB_WriteBatch100-12` | 151 | **4,115,308 ns/op** (~4.12 ms) | 35,035 B/op | 605 allocs/op | 100 keys/batch (~24,300 keys/sec) |
+| `BenchmarkDB_ParallelWriteBatch10-12` | 622 | **937,464 ns/op** (~0.94 ms) | 4,242 B/op | 73 allocs/op | 12-thread batched `fsync` (~10,667 keys/sec) |
+| `BenchmarkDB_Get-12` | 797,404 | **741.3 ns/op** | 144 B/op | 3 allocs/op | 1-seek `pread(2)` (~1.35M reads/sec) |

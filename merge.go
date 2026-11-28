@@ -48,6 +48,16 @@ type relocation struct {
 	newItem   index.Item
 }
 
+// mergeFailpoint is a test-only hook (nil in production) invoked at critical crash
+// boundaries during compaction and recovery.
+var mergeFailpoint func(point string)
+
+func hitFailpoint(point string) {
+	if mergeFailpoint != nil {
+		mergeFailpoint(point)
+	}
+}
+
 // Merge compacts all sealed data files (excluding the active file) to reclaim disk space
 // from overwritten values and tombstones without blocking ongoing Put/Delete/Get operations
 // during the heavy I/O copy phase.
@@ -176,6 +186,9 @@ func (db *DB) stageMergedFiles(tmpDir string, oldIDs []uint32, activeStartID uin
 							Timestamp:    rec.Timestamp,
 						},
 					})
+					if len(relocations) == 1 {
+						hitFailpoint("stage_mid_copy")
+					}
 				}
 			}
 
@@ -301,10 +314,16 @@ func commitMerge(tmpDir string, oldIDs, newIDs []uint32) error {
 	if err := syncDir(tmpDir); err != nil {
 		return err
 	}
+	hitFailpoint("commit_after_manifest")
+
 	if err := createMarkerAtomic(tmpDir, mergeCommittedMarker); err != nil {
 		return err
 	}
-	return syncDir(tmpDir)
+	if err := syncDir(tmpDir); err != nil {
+		return err
+	}
+	hitFailpoint("commit_after_committed")
+	return nil
 }
 
 // applyCompactionSwap performs Phase 4 under db.mu.Lock(): deletes old sealed files,
@@ -318,10 +337,13 @@ func (db *DB) applyCompactionSwap(tmpDir string, oldIDs, newIDs []uint32, reloca
 		return ErrDatabaseClosed
 	}
 
+	hitFailpoint("swap_before_delete_old")
+
 	// 1. Close and unlink old uncompacted files.
 	if err := db.storage.CloseAndDeleteOlderFiles(oldIDs); err != nil {
 		return err
 	}
+	hitFailpoint("swap_after_delete_old")
 
 	// 2. Mark OLD_DELETED so crash recovery never deletes newly moved files on ID overlap.
 	if err := createMarkerAtomic(tmpDir, mergeOldDeletedMarker); err != nil {
@@ -330,12 +352,16 @@ func (db *DB) applyCompactionSwap(tmpDir string, oldIDs, newIDs []uint32, reloca
 	if err := syncDir(tmpDir); err != nil {
 		return err
 	}
+	hitFailpoint("swap_after_old_deleted")
 
 	// 3. Move compacted files from .tmp/ into DirPath.
-	for _, id := range newIDs {
+	for i, id := range newIDs {
 		name := storage.DataFileName(id)
 		if err := os.Rename(filepath.Join(tmpDir, name), filepath.Join(db.options.DirPath, name)); err != nil {
 			return err
+		}
+		if i == 0 && len(newIDs) > 1 {
+			hitFailpoint("swap_mid_rename")
 		}
 	}
 
@@ -343,12 +369,14 @@ func (db *DB) applyCompactionSwap(tmpDir string, oldIDs, newIDs []uint32, reloca
 	if err := db.storage.AdoptOlderFiles(newIDs); err != nil {
 		return err
 	}
+	hitFailpoint("swap_after_adopt")
 
 	// 5. Conditionally update KeyDir pointers now that new files are open and registered.
 	for _, r := range relocations {
 		expected := index.Item{FileID: r.oldFileID, RecordOffset: r.oldOffset}
 		db.index.CompareAndSwap(r.key, expected, r.newItem)
 	}
+	hitFailpoint("swap_after_cas")
 
 	// 6. Persist directory renames and remove staging directory.
 	if err := syncDir(db.options.DirPath); err != nil {
@@ -393,22 +421,28 @@ func recoverMergeState(dirPath string) error {
 				return err
 			}
 		}
+		hitFailpoint("recover_after_delete_old")
+
 		if err := createMarkerAtomic(tmpDir, mergeOldDeletedMarker); err != nil {
 			return err
 		}
 		if err := syncDir(tmpDir); err != nil {
 			return err
 		}
+		hitFailpoint("recover_after_old_deleted")
 	}
 
 	// Case C: OLD_DELETED exists; move any remaining compacted files from .tmp/ into dirPath.
-	for _, id := range manifest.NewIDs {
+	for i, id := range manifest.NewIDs {
 		name := storage.DataFileName(id)
 		src := filepath.Join(tmpDir, name)
 		dst := filepath.Join(dirPath, name)
 		if fileExists(src) {
 			if err := os.Rename(src, dst); err != nil {
 				return err
+			}
+			if i+1 < len(manifest.NewIDs) {
+				hitFailpoint("recover_mid_rename")
 			}
 		}
 	}
