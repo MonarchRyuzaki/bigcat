@@ -129,8 +129,9 @@ func (db *DB) stageMergedFiles(tmpDir string, oldIDs []uint32, activeStartID uin
 		return nil, nil, err
 	}
 
-	writer := newMergeWriter(tmpDir, oldIDs, db.options.MaxFileSize, activeStartID)
+	writer := newMergeWriter(tmpDir, oldIDs, db.options.MaxFileSize, activeStartID, db.hintCodec)
 	var relocations []relocation
+	reader := bufio.NewReaderSize(nil, 256*1024)
 
 	for _, srcFileID := range oldIDs {
 		srcPath := filepath.Join(db.options.DirPath, storage.DataFileName(srcFileID))
@@ -140,8 +141,7 @@ func (db *DB) stageMergedFiles(tmpDir string, oldIDs []uint32, activeStartID uin
 			return nil, nil, err
 		}
 
-		// cant we just reuse the reader for each allocation ? instead of creating a buffer for each id ?
-		reader := bufio.NewReaderSize(f, 256*1024)
+		reader.Reset(f)
 		var currentOffset int64
 
 		for {
@@ -168,7 +168,7 @@ func (db *DB) stageMergedFiles(tmpDir string, oldIDs []uint32, activeStartID uin
 						return nil, nil, err
 					}
 
-					dstFileID, dstOffset, err := writer.writeRecord(encoded)
+					dstFileID, dstOffset, err := writer.writeRecord(rec, encoded)
 					if err != nil {
 						_ = f.Close()
 						writer.abort()
@@ -209,23 +209,28 @@ func (db *DB) stageMergedFiles(tmpDir string, oldIDs []uint32, activeStartID uin
 }
 
 // mergeWriter writes surviving compacted records into sequential storage.DataFile segments
-// inside tmpDir, rotating at maxFileSize while capping FileIDs strictly below activeStartID.
+// alongside companion .hint files inside tmpDir, rotating at maxFileSize while capping
+// FileIDs strictly below activeStartID.
 type mergeWriter struct {
 	tmpDir        string
 	idSlots       []uint32 // Reuses oldIDs slots (guarantees every dstID < activeStartID)
 	slotIdx       int
 	maxFileSize   int64
 	activeStartID uint32
+	hintCodec     record.HintCodec
 	currFile      *storage.DataFile
+	currHintFile  *os.File
+	currHintBuf   *bufio.Writer
 	createdIDs    []uint32
 }
 
-func newMergeWriter(tmpDir string, idSlots []uint32, maxFileSize int64, activeStartID uint32) *mergeWriter {
+func newMergeWriter(tmpDir string, idSlots []uint32, maxFileSize int64, activeStartID uint32, hintCodec record.HintCodec) *mergeWriter {
 	return &mergeWriter{
 		tmpDir:        tmpDir,
 		idSlots:       idSlots,
 		maxFileSize:   maxFileSize,
 		activeStartID: activeStartID,
+		hintCodec:     hintCodec,
 	}
 }
 
@@ -239,35 +244,74 @@ func (w *mergeWriter) openSlot(idx int) error {
 		return fmt.Errorf("merge: compacted file ID %d must be < active file ID %d", id, w.activeStartID)
 	}
 
-	path := filepath.Join(w.tmpDir, storage.DataFileName(id))
-	df, err := storage.OpenDataFileWithMode(path, id, false)
+	dataPath := filepath.Join(w.tmpDir, storage.DataFileName(id))
+	df, err := storage.OpenDataFileWithMode(dataPath, id, false)
 	if err != nil {
 		return err
 	}
 
+	hintPath := filepath.Join(w.tmpDir, storage.HintFileName(id))
+	hf, err := os.OpenFile(hintPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		_ = df.Close()
+		return err
+	}
+
+	if w.currHintBuf == nil {
+		w.currHintBuf = bufio.NewWriterSize(hf, 64*1024)
+	} else {
+		w.currHintBuf.Reset(hf)
+	}
+
 	w.currFile = df
+	w.currHintFile = hf
 	w.slotIdx = idx
 	w.createdIDs = append(w.createdIDs, id)
 	return nil
 }
 
-// writeRecord appends an encoded record to the current staged DataFile, rotating to the
-// next slot in idSlots when size > 0 and size + len(encoded) > maxFileSize.
-func (w *mergeWriter) writeRecord(encoded []byte) (fileID uint32, offset int64, err error) {
+func (w *mergeWriter) closeCurrentSlot(syncFiles bool) error {
+	var firstErr error
+	if w.currHintBuf != nil && w.currHintFile != nil {
+		if syncFiles {
+			if err := w.currHintBuf.Flush(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			if err := w.currHintFile.Sync(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if err := w.currHintFile.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		w.currHintFile = nil
+	}
+
+	if w.currFile != nil {
+		if syncFiles {
+			if err := w.currFile.Sync(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if err := w.currFile.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		w.currFile = nil
+	}
+	return firstErr
+}
+
+// writeRecord appends an encoded record to the current staged DataFile and writes its
+// corresponding HintRecord to the companion .hint file, rotating when maxFileSize is exceeded.
+func (w *mergeWriter) writeRecord(rec *record.Record, encoded []byte) (fileID uint32, offset int64, err error) {
 	if w.currFile == nil {
 		if err := w.openSlot(0); err != nil {
 			return 0, 0, err
 		}
 	} else if size := w.currFile.Size(); size > 0 && size+int64(len(encoded)) > w.maxFileSize && w.slotIdx+1 < len(w.idSlots) {
-		if err := w.currFile.Sync(); err != nil {
+		if err := w.closeCurrentSlot(true); err != nil {
 			return 0, 0, err
 		}
-		if err := w.currFile.Close(); err != nil {
-			w.currFile = nil
-			return 0, 0, err
-		}
-		w.currFile = nil
-
 		if err := w.openSlot(w.slotIdx + 1); err != nil {
 			return 0, 0, err
 		}
@@ -277,31 +321,34 @@ func (w *mergeWriter) writeRecord(encoded []byte) (fileID uint32, offset int64, 
 	if err != nil {
 		return 0, 0, err
 	}
+
+	hintBytes, err := w.hintCodec.EncodeHint(&record.HintRecord{
+		Timestamp:    rec.Timestamp,
+		ValueSize:    uint32(len(rec.Value)),
+		RecordOffset: offset,
+		Key:          rec.Key,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	if _, err := w.currHintBuf.Write(hintBytes); err != nil {
+		return 0, 0, err
+	}
+
 	return w.currFile.FileID(), offset, nil
 }
 
-// finish fsyncs and closes the final open staged file and returns all created FileIDs.
+// finish fsyncs and closes the final open staged data and hint files and returns all created FileIDs.
 func (w *mergeWriter) finish() ([]uint32, error) {
-	if w.currFile != nil {
-		syncErr := w.currFile.Sync()
-		closeErr := w.currFile.Close()
-		w.currFile = nil
-		if syncErr != nil {
-			return nil, syncErr
-		}
-		if closeErr != nil {
-			return nil, closeErr
-		}
+	if err := w.closeCurrentSlot(true); err != nil {
+		return nil, err
 	}
 	return w.createdIDs, nil
 }
 
-// abort closes any open staged file without syncing on error cleanup paths.
+// abort closes any open staged files without syncing on error cleanup paths.
 func (w *mergeWriter) abort() {
-	if w.currFile != nil {
-		_ = w.currFile.Close()
-		w.currFile = nil
-	}
+	_ = w.closeCurrentSlot(false)
 }
 
 // commitMerge writes manifest.json and atomically creates the COMMITTED marker in tmpDir.
@@ -354,11 +401,12 @@ func (db *DB) applyCompactionSwap(tmpDir string, oldIDs, newIDs []uint32, reloca
 	}
 	hitFailpoint("swap_after_old_deleted")
 
-	// 3. Move compacted files from .tmp/ into DirPath.
+	// 3. Move compacted .data and companion .hint files from .tmp/ into DirPath.
 	for i, id := range newIDs {
-		name := storage.DataFileName(id)
-		if err := os.Rename(filepath.Join(tmpDir, name), filepath.Join(db.options.DirPath, name)); err != nil {
-			return err
+		for _, name := range []string{storage.DataFileName(id), storage.HintFileName(id)} {
+			if err := os.Rename(filepath.Join(tmpDir, name), filepath.Join(db.options.DirPath, name)); err != nil {
+				return err
+			}
 		}
 		if i == 0 && len(newIDs) > 1 {
 			hitFailpoint("swap_mid_rename")
@@ -416,9 +464,11 @@ func recoverMergeState(dirPath string) error {
 	// Case B: Committed, but old files may still remain; finish unlinking and mark OLD_DELETED.
 	if !oldDeleted {
 		for _, id := range manifest.OldIDs {
-			p := filepath.Join(dirPath, storage.DataFileName(id))
-			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
+			for _, name := range []string{storage.DataFileName(id), storage.HintFileName(id)} {
+				p := filepath.Join(dirPath, name)
+				if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
 			}
 		}
 		hitFailpoint("recover_after_delete_old")
@@ -432,18 +482,19 @@ func recoverMergeState(dirPath string) error {
 		hitFailpoint("recover_after_old_deleted")
 	}
 
-	// Case C: OLD_DELETED exists; move any remaining compacted files from .tmp/ into dirPath.
+	// Case C: OLD_DELETED exists; move any remaining compacted .data and .hint files into dirPath.
 	for i, id := range manifest.NewIDs {
-		name := storage.DataFileName(id)
-		src := filepath.Join(tmpDir, name)
-		dst := filepath.Join(dirPath, name)
-		if fileExists(src) {
-			if err := os.Rename(src, dst); err != nil {
-				return err
+		for _, name := range []string{storage.DataFileName(id), storage.HintFileName(id)} {
+			src := filepath.Join(tmpDir, name)
+			dst := filepath.Join(dirPath, name)
+			if fileExists(src) {
+				if err := os.Rename(src, dst); err != nil {
+					return err
+				}
 			}
-			if i+1 < len(manifest.NewIDs) {
-				hitFailpoint("recover_mid_rename")
-			}
+		}
+		if i+1 < len(manifest.NewIDs) {
+			hitFailpoint("recover_mid_rename")
 		}
 	}
 

@@ -501,3 +501,46 @@ func TestFileManager_CloseAndDeleteOlderFiles_And_AdoptOlderFiles(t *testing.T) 
 	}
 }
 
+func TestFileManager_HintFilesIgnoredOnOpenAndCleanedOnDelete(t *testing.T) {
+	dir := t.TempDir()
+	fm, err := OpenFileManager(dir, 50)
+	if err != nil {
+		t.Fatalf("OpenFileManager failed: %v", err)
+	}
+
+	// Create files 0 (sealed) and 1 (active)
+	for i := 0; i < 2; i++ {
+		if _, _, err := fm.Write(bytes.Repeat([]byte{byte('a' + i)}, 40)); err != nil {
+			t.Fatalf("Write %d failed: %v", i, err)
+		}
+	}
+	if err := fm.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Place a companion 00000.hint file in the directory
+	hintPath := filepath.Join(dir, HintFileName(0))
+	if err := os.WriteFile(hintPath, []byte("dummy_hint"), 0644); err != nil {
+		t.Fatalf("WriteFile hint failed: %v", err)
+	}
+
+	// Reopen: OpenFileManager must ignore .hint and discover only [0, 1]
+	fm2, err := OpenFileManager(dir, 50)
+	if err != nil {
+		t.Fatalf("Reopen OpenFileManager failed: %v", err)
+	}
+	defer fm2.Close()
+
+	if !slices.Equal(fm2.FileIDs(), []uint32{0, 1}) {
+		t.Fatalf("expected FileIDs [0, 1], got %v", fm2.FileIDs())
+	}
+
+	// CloseAndDeleteOlderFiles([0]) must remove both 00000.data and 00000.hint
+	if err := fm2.CloseAndDeleteOlderFiles([]uint32{0}); err != nil {
+		t.Fatalf("CloseAndDeleteOlderFiles failed: %v", err)
+	}
+	if _, err := os.Stat(hintPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected companion hint file %s to be deleted, stat err=%v", hintPath, err)
+	}
+}
+

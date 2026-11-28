@@ -184,3 +184,23 @@ Measured after changing `DefaultOptions` in `options.go` to `SyncOnWrite: true` 
 | `BenchmarkDB_WriteBatch100-12` | 151 | **4,115,308 ns/op** (~4.12 ms) | 35,035 B/op | 605 allocs/op | 100 keys/batch (~24,300 keys/sec) |
 | `BenchmarkDB_ParallelWriteBatch10-12` | 622 | **937,464 ns/op** (~0.94 ms) | 4,242 B/op | 73 allocs/op | 12-thread batched `fsync` (~10,667 keys/sec) |
 | `BenchmarkDB_Get-12` | 797,404 | **741.3 ns/op** | 144 B/op | 3 allocs/op | 1-seek `pread(2)` (~1.35M reads/sec) |
+
+---
+
+## 10. Hint Codec & Cold Startup Recovery Benchmarks (Phase 3)
+
+Measured after implementing `.hint` binary encoding/decoding (`internal/record/hint.go`), companion `.hint` generation in `Merge()`, and hint-first `loadIndexFromDisk()`:
+
+### A. Hint Binary Codec (`go test -bench=Hint -benchmem -run=^$ ./internal/record`)
+
+| Benchmark | Operations | Latency | Memory / Op | Allocs / Op | Est. Throughput |
+|---|---|---|---|---|---|
+| `BenchmarkBinaryCodec_EncodeHint-12` | 24,533,372 | **46.23 ns/op** | 64 B/op | 1 allocs/op | **~21.6M ops/sec** |
+| `BenchmarkBinaryCodec_DecodeHint-12` | 11,828,518 | **91.47 ns/op** | 104 B/op | 3 allocs/op | **~10.9M ops/sec** |
+
+### B. Cold Startup Recovery (`go test -bench=ColdStartup -benchmem -run=^$ .`, 4,000 keys × 4KB values ≈ 16MB)
+
+| Benchmark | Operations | Startup Latency | Memory / Op | Allocs / Op | Speedup / Savings |
+|---|---|---|---|---|---|
+| `BenchmarkDB_ColdStartup_RawScan-12` | 223 | **5,611,723 ns/op** (~5.61 ms) | 21,116,219 B/op (~20.1 MB) | 16,197 allocs/op | Baseline (scans full `.data` payloads) |
+| `BenchmarkDB_ColdStartup_WithHints-12` | 1,078 | **1,063,194 ns/op** (~1.06 ms) | 1,710,952 B/op (~1.63 MB) | 16,170 allocs/op | **~5.3x faster startup**, **~12.3x less memory allocated** |
