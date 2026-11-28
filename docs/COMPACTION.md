@@ -1,8 +1,6 @@
-# BigCat: Compaction & Merging Design (`Merge`)
+# BigCat: Compaction, Hint Files & Background Triggers (`Merge`)
 
-This document describes the architecture, decision rationale, crash-recovery state machine, and concurrency model for BigCat's log compaction process (`Merge()`).
-
-> **Scope Note:** Companion `.hint` file generation for fast startup recovery is intentionally excluded from this document and will layer cleanly onto the staging pipeline described below in a subsequent step.
+This document describes the architecture, design rationale, crash-recovery state machine, companion `.hint` files, and background compaction triggers for BigCat's `Merge()` engine.
 
 ---
 
@@ -209,8 +207,39 @@ Every recovery transition is idempotent across repeated crashes during recovery.
 
 ---
 
-## 8. Edge Cases
+## 8. Companion `.hint` Files & Fast Cold Startup
 
-* **Zero surviving keys:** If every key in `00001–00004` was overwritten in `00005` or deleted, `new_ids` in `.tmp/manifest.json` is empty (`[]`). Phase 4 deletes `00001–00004`, leaves `00005` as the sole file, and removes `.tmp/`.
-* **`MaxFileSize` shrunk across restarts:** If `00001–00004` were originally created with `MaxFileSize = 64MB` and the DB is later reopened with `1MB`, splitting surviving data strictly at `1MB` could require more than 4 output files and collide with `00005`. [`mergeWriter`](../merge.go#L199-L291) caps rotation to the slots in `oldIDs` (`< activeStartID`), continuing to append to the final slot instead of allocating an ID `>= activeStartID`.
+During Phase 2 (`stageMergedFiles`), `mergeWriter` writes a companion `<file_id>.hint` file alongside every compacted `<file_id>.data` file:
+* **Binary Format ([`internal/record/hint.go`](../internal/record/hint.go)):** 28-byte Little-Endian header + variable key (`CRC32 (4B) | Timestamp (8B) | KeySize (4B) | ValueSize (4B) | RecordOffset (8B) | Key (bytes)`), verified with IEEE CRC32.
+* **Atomic Lifecycle:** Staged `.hint` files are flushed, `fsync`ed, renamed, and crash-recovered alongside `.data` files in Phase 4 and `recoverMergeState`. `CloseAndDeleteOlderFiles` unlinks both `.data` and `.hint` for old files so no orphaned `.hint` files remain.
+* **Startup Recovery ([`loadIndexFromDisk`](../db.go)):** Checks `<file_id>.hint` first (`scanHintFile`, skipping value payloads on disk) and falls back to scanning raw `.data` when absent (e.g., active or unmerged files).
+
+---
+
+## 9. Automatic Background Compaction Triggers & `COMPACT` Command
+
+Compaction can run manually (`db.Merge()` or RESP `COMPACT`) or automatically via a background worker started in `Open()`:
+
+* **Options ([`options.go`](../options.go)) & CLI ([`cmd/bigcat/main.go`](../cmd/bigcat/main.go)):**
+  * `WithAutoCompactInterval` (`-compact-interval`, CLI default `5m`): Periodic ticker checks.
+  * `WithCompactMinFiles` (`-compact-min-files`, CLI default `4`): Minimum sealed `.data` files required before compacting.
+  * `WithCompactDeadSpaceRatio` (`-compact-dead-ratio`, CLI default `0.4`): Minimum dead-space fraction (`0.0–1.0]`).
+* **Rotation Wakeups & Overlap Guard:** Whenever `GroupCommitter.flushBatch()` observes a `FileID` change (active file rotated), it sends a non-blocking signal on `compactNotifyCh`. The worker calls `tryBackgroundMerge()` using `mergeMu.TryLock()` so overlapping triggers skip cleanly rather than queueing.
+* **Graceful Shutdown (`DB.Close()`):** Stops `GroupCommitter` first (preventing new rotation signals), closes `compactStopCh` and waits for `compactWg.Wait()` so any in-flight `Merge()` finishes before closing `FileManager` and `KeyDir`.
+
+### Design Decision: O(1) Global Counter Heuristic for Dead Space (`totalBytes` vs `liveBytes`)
+
+To evaluate `CompactDeadSpaceRatio` without scanning `KeyDir` ($O(N_{\text{keys}})$) or maintaining per-file byte maps:
+* **`FileManager.totalBytes`** tracks total on-disk bytes across all `.data` files (`activeFile` + `olderFiles`) via `Stat()` on `Open()`, `Write()`, `CloseAndDeleteOlderFiles()`, and `AdoptOlderFiles()`.
+* **`MapIndex.liveBytes`** tracks total `RecordSize` of all active keys via `Put()`, `Delete()`, and `CompareAndSwap()`.
+* `shouldCompact()` computes `deadBytes = totalBytes - liveBytes` and `deadRatio = deadBytes / totalBytes` in **$O(1)$ time with zero allocations**.
+
+> **Intentional Approximation Tradeoff:** Because `totalBytes` and `liveBytes` include the **active file** as well as sealed files, heavy overwrites inside the current active file raise the global `deadRatio` even though `Merge()` only compacts sealed files. Pairing `CompactDeadSpaceRatio` with `CompactMinFiles` (e.g., `4`) bounds this effect—once multiple sealed files exist, sealed segments dominate `totalBytes`, making the global ratio a reliable, zero-overhead trigger heuristic.
+
+---
+
+## 10. Edge Cases
+
+* **Zero surviving keys:** If every key in `00001–00004` was overwritten in `00005` or deleted, `new_ids` in `.tmp/manifest.json` is empty (`[]`). Phase 4 deletes `00001–00004` (and any old `.hint` files), leaves `00005` as the sole file, and removes `.tmp/`.
+* **`MaxFileSize` shrunk across restarts:** If `00001–00004` were originally created with `MaxFileSize = 64MB` and the DB is later reopened with `1MB`, splitting surviving data strictly at `1MB` could require more than 4 output files and collide with `00005`. [`mergeWriter`](../merge.go) caps rotation to the slots in `oldIDs` (`< activeStartID`), continuing to append to the final slot instead of allocating an ID `>= activeStartID`.
 * **Single file only (`len(olderFiles) == 0`):** If only the active file exists, `Merge()` returns `nil` as a no-op (or callers may explicitly `Rotate()` beforehand if they wish to compact the current active file).

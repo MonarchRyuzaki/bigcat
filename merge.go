@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"bigcat/internal/index"
 	"bigcat/internal/record"
@@ -75,8 +76,21 @@ func (db *DB) Merge() error {
 	db.mergeMu.Lock()
 	defer db.mergeMu.Unlock()
 
+	return db.mergeLocked()
+}
+
+func (db *DB) tryBackgroundMerge() {
+	if !db.mergeMu.TryLock() {
+		return
+	}
+	defer db.mergeMu.Unlock()
+
+	_ = db.mergeLocked()
+}
+
+func (db *DB) mergeLocked() error {
 	db.mu.RLock()
-	closed = db.isClosed
+	closed := db.isClosed
 	db.mu.RUnlock()
 	if closed {
 		return ErrDatabaseClosed
@@ -116,6 +130,93 @@ func (db *DB) Merge() error {
 
 	// Phase 4: Brief atomic swap of files and KeyDir pointers under db.mu.Lock().
 	return db.applyCompactionSwap(tmpDir, oldIDs, newIDs, relocations)
+}
+
+func (db *DB) startCompactor() {
+	if db.options.AutoCompactInterval <= 0 &&
+		db.options.CompactMinFiles <= 0 &&
+		db.options.CompactDeadSpaceRatio <= 0 {
+		return
+	}
+
+	db.compactNotifyCh = make(chan struct{}, 1)
+	db.compactStopCh = make(chan struct{})
+	db.compactWg.Add(1)
+	go db.compactionLoop()
+}
+
+func (db *DB) stopCompactor() {
+	if db.compactStopCh == nil {
+		return
+	}
+	db.compactStopOnce.Do(func() {
+		close(db.compactStopCh)
+	})
+	db.compactWg.Wait()
+}
+
+func (db *DB) notifyCompaction() {
+	if db.compactNotifyCh == nil {
+		return
+	}
+	select {
+	case db.compactNotifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (db *DB) compactionLoop() {
+	defer db.compactWg.Done()
+
+	var tickerC <-chan time.Time
+	if db.options.AutoCompactInterval > 0 {
+		ticker := time.NewTicker(db.options.AutoCompactInterval)
+		defer ticker.Stop()
+		tickerC = ticker.C
+	}
+
+	for {
+		select {
+		case <-db.compactStopCh:
+			return
+		case <-tickerC:
+		case <-db.compactNotifyCh:
+		}
+
+		// Re-check stop signal before launching a merge if both fired simultaneously.
+		select {
+		case <-db.compactStopCh:
+			return
+		default:
+		}
+
+		if db.shouldCompact() {
+			db.tryBackgroundMerge()
+		}
+	}
+}
+
+func (db *DB) shouldCompact() bool {
+	sealedCount, totalBytes := db.storage.DiskStats()
+	if sealedCount == 0 {
+		return false
+	}
+	if db.options.CompactMinFiles > 0 && sealedCount < db.options.CompactMinFiles {
+		return false
+	}
+	if db.options.CompactDeadSpaceRatio > 0 {
+		if totalBytes <= 0 {
+			return false
+		}
+		liveBytes := db.index.LiveBytes()
+		deadBytes := totalBytes - liveBytes
+		if deadBytes <= 0 {
+			return false
+		}
+		deadRatio := float64(deadBytes) / float64(totalBytes)
+		return deadRatio >= db.options.CompactDeadSpaceRatio
+	}
+	return true
 }
 
 // stageMergedFiles streams every sealed file in oldIDs sequentially, filters out obsolete

@@ -41,6 +41,13 @@ If **any** bug, race condition, durability gap, missing error check, silent data
    - Update `docs/BENCHMARKS.md` (when engine/storage/network performance characteristics change) and/or record exact observed numbers (`ns/op`, `B/op`, `allocs/op`, throughput) in the PR summary.
    - Never estimate or extrapolate unprinted numbers—only record directly observed benchmark output.
 
-### Gate 5: Ship (Only After Gates 1–4 Are Green)
-1. Inspect `git status` and `git diff` to verify only intended changes and updated docs (`README.md`, `docs/COMPACTION.md`, `docs/BENCHMARKS.md`) are included.
-2. Commit on a descriptive branch (linked to the GitHub issue), push to `origin`, and open a Pull Request via `gh pr create` referencing the issue and summarizing test + benchmark verification.
+### Gate 5: Documentation & Decision Log
+1. **Document Design Decisions & Tradeoffs:**
+   - Record **why** key architectural choices, heuristics, approximations, and constraints exist (e.g. in `docs/COMPACTION.md`, `docs/ARCHITECTURE_AND_ROADMAP.md`, or inline doc comments) so future contributors understand the rationale and edge cases.
+   - When introducing a new subsystem or major feature, create a dedicated markdown document under `docs/` (e.g., `docs/<FEATURE>.md`) rather than cramming unrelated subsystems into one file.
+2. **Sync User-Facing Docs & Roadmaps:**
+   - Update `README.md` (CLI flags, commands, examples, roadmap checkboxes) and `docs/` whenever public behavior, defaults, or roadmap milestones change.
+
+### Gate 6: Ship (Only After Gates 1–5 Are Green)
+1. Inspect `git status` and `git diff` to verify only intended changes and updated docs are included.
+2. Commit on a descriptive branch (linked to the GitHub issue), push to `origin`, and open a Pull Request via `gh pr create` referencing the issue and summarizing test + benchmark + decision verification.

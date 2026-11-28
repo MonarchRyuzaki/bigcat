@@ -65,6 +65,8 @@ type GroupCommitter struct {
 	wg            sync.WaitGroup
 	maxBatchSize  int
 	maxBatchBytes int
+	hasLastFileID bool
+	lastFileID    uint32
 }
 
 // newGroupCommitter creates and starts a new GroupCommitter worker.
@@ -203,6 +205,14 @@ func (gc *GroupCommitter) flushBatch(batch []*writeTask) {
 		}
 	}
 	gc.db.mu.Unlock()
+
+	if err == nil {
+		if gc.hasLastFileID && fileID != gc.lastFileID {
+			gc.db.notifyCompaction()
+		}
+		gc.lastFileID = fileID
+		gc.hasLastFileID = true
+	}
 
 	// 7. Unblock callers outside the database lock so they can proceed immediately
 	for _, task := range batch {

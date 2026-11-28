@@ -16,15 +16,19 @@ import (
 // DB represents a BigCat key-value storage engine instance.
 // It coordinates append-only multi-file storage on disk with an in-memory KeyDir index.
 type DB struct {
-	mu        sync.RWMutex
-	mergeMu   sync.Mutex // Serializes concurrent Merge() runs so only one .tmp/ compaction runs at a time
-	options   Options
-	storage   *storage.FileManager
-	index     index.Indexer
-	codec     record.Codec
-	hintCodec record.HintCodec
-	committer *GroupCommitter
-	isClosed  bool
+	mu              sync.RWMutex
+	mergeMu         sync.Mutex // Serializes concurrent Merge() runs so only one .tmp/ compaction runs at a time
+	options         Options
+	storage         *storage.FileManager
+	index           index.Indexer
+	codec           record.Codec
+	hintCodec       record.HintCodec
+	committer       *GroupCommitter
+	compactNotifyCh chan struct{}
+	compactStopCh   chan struct{}
+	compactStopOnce sync.Once
+	compactWg       sync.WaitGroup
+	isClosed        bool
 }
 
 // Open initializes and opens a BigCat storage engine instance in the specified directory.
@@ -73,8 +77,9 @@ func Open(dirPath string, opts ...Option) (*DB, error) {
 		return nil, err
 	}
 
-	// 6. Start background group committer worker
+	// 6. Start background group committer worker and optional auto-compaction worker
 	db.committer = newGroupCommitter(db, DefaultMaxBatchSize, DefaultMaxBatchBytes)
+	db.startCompactor()
 
 	return db, nil
 }
@@ -366,14 +371,17 @@ func (db *DB) Sync() error {
 	return db.storage.Sync()
 }
 
-// Close flushes data to disk and closes all open data files and index.
+// Close flushes data to disk, drains background compaction, and closes all open data files and index.
 func (db *DB) Close() error {
-	// 1. Stop committer and drain any pending writes
+	// 1. Stop committer and drain any pending writes (prevents new rotation notifications)
 	if db.committer != nil {
 		if err := db.committer.Close(); err != nil {
 			return err
 		}
 	}
+
+	// 2. Stop background compaction worker and wait for any active Merge() before closing storage/index
+	db.stopCompactor()
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -384,11 +392,11 @@ func (db *DB) Close() error {
 
 	db.isClosed = true
 
-	// 2. Sync and close all data files via FileManager
+	// 3. Sync and close all data files via FileManager
 	if err := db.storage.Close(); err != nil {
 		return err
 	}
 
-	// 3. Clear in-memory index
+	// 4. Clear in-memory index
 	return db.index.Close()
 }

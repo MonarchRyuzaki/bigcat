@@ -129,15 +129,17 @@ type Item struct {
 - [x] Directory scanner and startup recovery (rebuilding `KeyDir` from all files in ascending sequence).
 - [x] Tombstone replay and lifecycle across multiple rotated files.
 
-### Phase 2.5: High-Concurrency Write Optimizations (Group Commit & Lock Elision)
-- [ ] Pre-encode & compute CRC32 checksums outside the write mutex (fine-grained locking).
-- [ ] Group commit / write batching: aggregate concurrent client writes into batched disk flushes.
-- [ ] Re-benchmark high-concurrency `SET` throughput over TCP with `redis-benchmark -c 50`.
+### Phase 2.5: High-Concurrency Write Optimizations (COMPLETED ✅)
+- [x] Pre-encode & compute CRC32 checksums outside the write mutex (lock elision).
+- [x] Group commit / write batching: aggregate concurrent client writes into batched disk flushes (`GroupCommitter`).
+- [x] Re-benchmark high-concurrency `SET` throughput over TCP with `redis-benchmark -c 50`.
 
-### Phase 3: Compaction / Merging & Hint Files
-- [ ] Background/manual `Merge()` to reclaim space from deleted/updated keys.
-- [ ] Generation of `.hint` files containing only index headers (`Timestamp | KeySize | ValueSize | RecordOffset | Key`).
-- [ ] Fast startup: Load `.hint` files first instead of scanning multi-gigabyte data files.
+### Phase 3: Compaction / Merging, Hint Files & Resilience (COMPLETED ✅)
+- [x] Background/manual `Merge()` to reclaim space from deleted/updated keys (see [COMPACTION.md](COMPACTION.md)).
+- [x] Generation of `.hint` files (`28B` header with CRC32: `CRC | Timestamp | KeySize | ValueSize | RecordOffset | Key`) during compaction.
+- [x] Fast startup: Load `.hint` files first instead of scanning multi-gigabyte data files (`loadIndexFromDisk()`).
+- [x] Automatic background compaction triggers (`AutoCompactInterval`, `CompactMinFiles`, `CompactDeadSpaceRatio`) and RESP `COMPACT` command.
+- [x] MIT-style randomized `SIGKILL` & deterministic failpoint crash-recovery test suite (`crash_test.go`).
 
 ### Phase 4: RESP Protocol Server & CLI (COMPLETED ✅)
 - [x] RESP v2 parser and serializer (`internal/resp`).

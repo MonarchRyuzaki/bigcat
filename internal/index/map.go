@@ -6,8 +6,9 @@ import (
 
 // MapIndex implements Indexer using a standard Go map protected by a sync.RWMutex.
 type MapIndex struct {
-	mu    sync.RWMutex
-	items map[string]Item
+	mu        sync.RWMutex
+	items     map[string]Item
+	liveBytes int64
 }
 
 // NewMapIndex creates and returns an initialized MapIndex.
@@ -21,7 +22,11 @@ func NewMapIndex() *MapIndex {
 func (m *MapIndex) Put(key string, item Item) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if old, exists := m.items[key]; exists {
+		m.liveBytes -= int64(old.RecordSize)
+	}
 	m.items[key] = item
+	m.liveBytes += int64(item.RecordSize)
 }
 
 // CompareAndSwap updates key to updated only if key currently exists in m.items
@@ -41,7 +46,9 @@ func (m *MapIndex) CompareAndSwap(key string, expected, updated Item) bool {
 	if cur.FileID != expected.FileID || cur.RecordOffset != expected.RecordOffset {
 		return false
 	}
+	m.liveBytes -= int64(cur.RecordSize)
 	m.items[key] = updated
+	m.liveBytes += int64(updated.RecordSize)
 	return true
 }
 
@@ -57,7 +64,10 @@ func (m *MapIndex) Get(key string) (Item, bool) {
 func (m *MapIndex) Delete(key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.items, key)
+	if old, exists := m.items[key]; exists {
+		m.liveBytes -= int64(old.RecordSize)
+		delete(m.items, key)
+	}
 }
 
 // Keys returns a slice of all active keys in the index.
@@ -80,6 +90,13 @@ func (m *MapIndex) Size() int {
 	return len(m.items)
 }
 
+// LiveBytes returns the total on-disk RecordSize (in bytes) of all active entries in the index.
+func (m *MapIndex) LiveBytes() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.liveBytes
+}
+
 // Close cleans up index resources by freeing the in-memory map.
 // This allows Go's Garbage Collector to immediately reclaim RAM.
 // It does NOT delete or touch any persistent data on disk!
@@ -87,5 +104,6 @@ func (m *MapIndex) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.items = nil
+	m.liveBytes = 0
 	return nil
 }

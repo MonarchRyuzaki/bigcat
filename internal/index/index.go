@@ -41,6 +41,9 @@ type Indexer interface {
 	// Size returns the total number of keys in the index.
 	Size() int
 
+	// LiveBytes returns the total on-disk RecordSize (in bytes) of all active keys in the index.
+	LiveBytes() int64
+
 	// Close releases any resources associated with the index.
 	Close() error
 }

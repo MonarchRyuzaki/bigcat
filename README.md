@@ -133,9 +133,12 @@ BigCat provides configurable flags to fine-tune durability, rotation frequency, 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `-port` | `int` | `6380` | TCP port BigCat listens on. |
-| `-dir` | `string` | `./data` | Filesystem directory path where all `.data` files are stored. |
+| `-dir` | `string` | `./data` | Filesystem directory path where all `.data` and `.hint` files are stored. |
 | `-max-file-size` | `int64` | `67108864` (64MB) | Max size of an active file in bytes before rotating to a new immutable file. Set to smaller values (e.g. `1048576` for 1MB or `262144` for 256KB) to test rotation! |
-| `-sync` | `bool` | `true` | When `true`, calls `fsync(2)` on disk after every write (maximum durability). Set to `false` for maximum write throughput via OS page cache. |
+| `-sync` | `bool` | `true` | When `true`, calls `fsync(2)` on disk after every write (maximum durability; also default in Go library `DefaultOptions`). Set to `false` for maximum write throughput via OS page cache. |
+| `-compact-interval` | `duration` | `5m` | Interval for background compaction checks (`0` disables periodic ticker checks). |
+| `-compact-min-files` | `int` | `4` | Minimum sealed `.data` files required before automatic compaction triggers (`0` for no minimum). |
+| `-compact-dead-ratio` | `float64` | `0.4` | Minimum approximate dead-space ratio (`0.0–1.0]`) required before automatic compaction triggers (`0` disables ratio check). |
 
 #### Example: High-Throughput Setup with 16MB File Rotation
 ```bash
@@ -189,6 +192,9 @@ OK
 
 127.0.0.1:6380> GET user:100
 (nil)
+
+127.0.0.1:6380> COMPACT
+OK
 
 127.0.0.1:6380> QUIT
 OK
@@ -297,7 +303,7 @@ func main() {
   - [x] Comprehensive test suite & benchmarks
 - [x] **RESP Protocol Server & CLI**
   - [x] RESP v2 parser and serializer (`internal/resp`)
-  - [x] TCP command dispatcher (`PING`, `SET`, `MSET`, `GET`, `DEL`, `KEYS`, `COMMAND`, `QUIT`)
+  - [x] TCP command dispatcher (`PING`, `SET`, `MSET`, `GET`, `DEL`, `KEYS`, `COMPACT`, `COMMAND`, `QUIT`)
   - [x] Full compatibility with `redis-cli` and `redis-benchmark`
 - [x] **Phase 2: Multi-File Rotation & Directory Management**
   - [x] File rotation upon reaching size threshold (e.g. 64MB)
@@ -309,9 +315,10 @@ func main() {
 - [x] **Batch Write API & Redis MSET**
   - [x] Atomic `WriteBatch` API with in-memory deduplicating buffer
   - [x] Multi-key Redis `MSET` command over RESP
-- [ ] **Phase 3: Compaction / Merging & Hint Files**
-  - [ ] Background garbage collection of overwritten/deleted records
-  - [ ] `.hint` files for near-instant cold startups
+- [x] **Phase 3: Compaction / Merging, Hint Files & Resilience**
+  - [x] Background & manual `Merge()` garbage collection of overwritten/deleted records + `COMPACT` command
+  - [x] Companion `.hint` files for fast cold startups
+  - [x] MIT-style randomized `SIGKILL` and deterministic failpoint crash-recovery tests (`crash_test.go`)
 - [ ] **Phase 4: Pluggable Storage Engine Architecture (Dual-Paradigm)**
   - [ ] Abstract `Engine` interface decoupling the RESP server from underlying storage backends
   - [ ] Engine selection flag: `-engine=bitcask` (append-only log) vs `-engine=ryudb` (4KB B-Tree)

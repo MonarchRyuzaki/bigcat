@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"bigcat"
 	"bigcat/internal/server"
@@ -17,6 +18,9 @@ func main() {
 	dataDir := flag.String("dir", "./data", "Directory to store BigCat data files")
 	syncOnWrite := flag.Bool("sync", true, "fsync data to disk after every write operation")
 	maxFileSize := flag.Int64("max-file-size", bigcat.DefaultMaxFileSize, "Maximum size in bytes before rotating data files")
+	compactInterval := flag.Duration("compact-interval", 5*time.Minute, "Interval for background compaction checks (0 to disable periodic checks)")
+	compactMinFiles := flag.Int("compact-min-files", 4, "Minimum sealed files required before automatic compaction triggers (0 for no minimum)")
+	compactDeadRatio := flag.Float64("compact-dead-ratio", 0.4, "Minimum dead-space ratio (0.0-1.0] across sealed files before automatic compaction triggers")
 	flag.Parse()
 
 	banner := `
@@ -35,6 +39,9 @@ func main() {
 	opts := []bigcat.Option{
 		bigcat.WithSyncOnWrite(*syncOnWrite),
 		bigcat.WithMaxFileSize(*maxFileSize),
+		bigcat.WithAutoCompactInterval(*compactInterval),
+		bigcat.WithCompactMinFiles(*compactMinFiles),
+		bigcat.WithCompactDeadSpaceRatio(*compactDeadRatio),
 	}
 	db, err := bigcat.Open(*dataDir, opts...)
 	if err != nil {

@@ -303,3 +303,43 @@ func BenchmarkMapIndex_ParallelGet(b *testing.B) {
 		}
 	})
 }
+
+func TestMapIndex_LiveBytes(t *testing.T) {
+	idx := NewMapIndex()
+	defer idx.Close()
+
+	if idx.LiveBytes() != 0 {
+		t.Fatalf("initial LiveBytes = %d, want 0", idx.LiveBytes())
+	}
+
+	idx.Put("a", Item{FileID: 0, RecordSize: 100})
+	idx.Put("b", Item{FileID: 1, RecordSize: 250})
+	if idx.LiveBytes() != 350 {
+		t.Fatalf("LiveBytes after inserts = %d, want 350", idx.LiveBytes())
+	}
+
+	// Overwrite updates delta
+	idx.Put("a", Item{FileID: 2, RecordSize: 180})
+	if idx.LiveBytes() != 430 {
+		t.Fatalf("LiveBytes after overwrite = %d, want 430", idx.LiveBytes())
+	}
+
+	// CompareAndSwap updates delta
+	if !idx.CompareAndSwap("b", Item{FileID: 1, RecordOffset: 0}, Item{FileID: 0, RecordSize: 200}) {
+		t.Fatalf("expected CompareAndSwap to succeed")
+	}
+	if idx.LiveBytes() != 380 {
+		t.Fatalf("LiveBytes after CompareAndSwap = %d, want 380", idx.LiveBytes())
+	}
+
+	// Delete subtracts RecordSize
+	idx.Delete("a")
+	if idx.LiveBytes() != 200 {
+		t.Fatalf("LiveBytes after Delete = %d, want 200", idx.LiveBytes())
+	}
+
+	_ = idx.Close()
+	if idx.LiveBytes() != 0 {
+		t.Fatalf("LiveBytes after Close = %d, want 0", idx.LiveBytes())
+	}
+}

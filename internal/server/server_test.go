@@ -129,7 +129,15 @@ func TestServer_CommandsOverTCP(t *testing.T) {
 		t.Errorf("expected :5 deleted keys, got %q", res)
 	}
 
-	// 10. QUIT
+	// 10. COMPACT command & arity check
+	if res := sendAndReceive("COMPACT extra"); !strings.HasPrefix(res, "-ERR wrong number of arguments") {
+		t.Errorf("expected wrong number of arguments for COMPACT, got %q", res)
+	}
+	if res := sendAndReceive("COMPACT"); res != "+OK" {
+		t.Errorf("expected +OK for COMPACT, got %q", res)
+	}
+
+	// 11. QUIT
 	if res := sendAndReceive("QUIT"); res != "+OK" {
 		t.Errorf("expected +OK on QUIT, got %q", res)
 	}
@@ -196,6 +204,21 @@ func TestServer_MultiFileRotationOverTCP(t *testing.T) {
 	}
 	if res := sendAndReceive("GET key:a"); res != "$-1" {
 		t.Fatalf("expected $-1 for deleted key:a, got %q", res)
+	}
+
+	// 4. Trigger compaction over TCP and verify remaining keys still read cleanly
+	if res := sendAndReceive("COMPACT"); res != "+OK" {
+		t.Fatalf("expected +OK for COMPACT, got %q", res)
+	}
+	if res := sendAndReceive("GET key:a"); res != "$-1" {
+		t.Fatalf("expected $-1 for deleted key:a after COMPACT, got %q", res)
+	}
+	if res := sendAndReceive("GET key:b"); !strings.HasPrefix(res, "$") {
+		t.Fatalf("expected bulk string prefix $ for key:b after COMPACT, got %q", res)
+	}
+	payloadB, _ := reader.ReadString('\n')
+	if strings.TrimRight(payloadB, "\r\n") != "value_payload_number_1" {
+		t.Fatalf("value mismatch for key:b after COMPACT: got %q", payloadB)
 	}
 }
 

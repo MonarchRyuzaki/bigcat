@@ -77,6 +77,9 @@ type FileManager struct {
 	// olderFiles stores sealed, immutable data files indexed by fileID.
 	// Reads against these files do not contend with active file appends.
 	olderFiles map[uint32]*DataFile
+
+	// totalBytes tracks the combined on-disk byte size of activeFile and all olderFiles.
+	totalBytes int64
 }
 
 // OpenFileManager initializes or opens an existing multi-file storage directory.
@@ -137,6 +140,7 @@ func OpenFileManager(dirPath string, maxFileSize int64) (*FileManager, error) {
 			return nil, err
 		}
 		fm.olderFiles[id] = df
+		fm.totalBytes += df.Size()
 	}
 
 	// Open highest ID in read-write append mode (readOnly = false)
@@ -148,6 +152,7 @@ func OpenFileManager(dirPath string, maxFileSize int64) (*FileManager, error) {
 		return nil, err
 	}
 	fm.activeFile = activeFile
+	fm.totalBytes += activeFile.Size()
 
 	return fm, nil
 }
@@ -178,6 +183,7 @@ func (fm *FileManager) Write(data []byte) (fileID uint32, offset int64, err erro
 	if err != nil {
 		return 0, 0, err
 	}
+	fm.totalBytes += int64(len(data))
 
 	return fm.activeFile.FileID(), offset, nil
 }
@@ -266,6 +272,14 @@ func (fm *FileManager) SealedSnapshot() (sealedIDs []uint32, activeID uint32) {
 	return sealedIDs, activeID
 }
 
+// DiskStats returns the number of sealed files and the total on-disk bytes across all
+// managed .data files (active + sealed) in O(1) time.
+func (fm *FileManager) DiskStats() (sealedCount int, totalBytes int64) {
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+	return len(fm.olderFiles), fm.totalBytes
+}
+
 // CloseAndDeleteOlderFiles detaches and closes the DataFile handles for fileIDs from olderFiles,
 // and unlinks their corresponding .data and companion .hint files from fm.dirPath.
 // Called during compaction Phase 4 under DB lock before moving compacted files out of .tmp/.
@@ -275,7 +289,12 @@ func (fm *FileManager) CloseAndDeleteOlderFiles(fileIDs []uint32) error {
 
 	for _, id := range fileIDs {
 		if df, ok := fm.olderFiles[id]; ok {
+			size := df.Size()
 			delete(fm.olderFiles, id)
+			fm.totalBytes -= size
+			if fm.totalBytes < 0 {
+				fm.totalBytes = 0
+			}
 			if err := df.Close(); err != nil {
 				return err
 			}
@@ -316,9 +335,11 @@ func (fm *FileManager) AdoptOlderFiles(fileIDs []uint32) error {
 
 	for id, df := range opened {
 		if existing, ok := fm.olderFiles[id]; ok {
+			fm.totalBytes -= existing.Size()
 			_ = existing.Close()
 		}
 		fm.olderFiles[id] = df
+		fm.totalBytes += df.Size()
 	}
 	return nil
 }
@@ -392,6 +413,7 @@ func (fm *FileManager) Close() error {
 		}
 		delete(fm.olderFiles, id)
 	}
+	fm.totalBytes = 0
 
 	return firstErr
 }

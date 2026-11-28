@@ -544,3 +544,38 @@ func TestFileManager_HintFilesIgnoredOnOpenAndCleanedOnDelete(t *testing.T) {
 	}
 }
 
+func TestFileManager_DiskStats(t *testing.T) {
+	dir := t.TempDir()
+	fm, err := OpenFileManager(dir, 60)
+	if err != nil {
+		t.Fatalf("OpenFileManager failed: %v", err)
+	}
+	defer fm.Close()
+
+	sealedCount, total := fm.DiskStats()
+	if sealedCount != 0 || total != 0 {
+		t.Fatalf("expected empty DiskStats, got sealed=%d total=%d", sealedCount, total)
+	}
+
+	// Write 50 bytes -> file 0; write 50 bytes -> rotates to file 1; write 50 bytes -> rotates to file 2
+	for i := 0; i < 3; i++ {
+		if _, _, err := fm.Write(bytes.Repeat([]byte{byte('x' + i)}, 50)); err != nil {
+			t.Fatalf("Write %d failed: %v", i, err)
+		}
+	}
+
+	sealedCount, total = fm.DiskStats()
+	if sealedCount != 2 || total != 150 {
+		t.Fatalf("expected 2 sealed files and 150 total bytes, got sealed=%d total=%d", sealedCount, total)
+	}
+
+	// Delete older files -> totalBytes drops to just active file (50 bytes)
+	if err := fm.CloseAndDeleteOlderFiles([]uint32{0, 1}); err != nil {
+		t.Fatalf("CloseAndDeleteOlderFiles failed: %v", err)
+	}
+	sealedCount, total = fm.DiskStats()
+	if sealedCount != 0 || total != 50 {
+		t.Fatalf("expected 0 sealed files and 50 total bytes after delete, got sealed=%d total=%d", sealedCount, total)
+	}
+}
+

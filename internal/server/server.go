@@ -251,6 +251,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 			_ = bufWriter.Flush()
 			return
 
+		case "COMPACT":
+			if len(cmd) != 1 {
+				_ = writer.WriteError("wrong number of arguments for 'compact' command")
+			} else if err := s.db.Merge(); err != nil {
+				_ = writer.WriteError(err.Error())
+			} else {
+				_ = writer.WriteSimpleString("OK")
+			}
+
 		default:
 			_ = writer.WriteError(fmt.Sprintf("unknown command '%s'", strings.ToLower(commandName)))
 		}
