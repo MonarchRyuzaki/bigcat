@@ -118,6 +118,101 @@ func TestMapIndex_Close(t *testing.T) {
 	}
 }
 
+func TestMapIndex_CompareAndSwap(t *testing.T) {
+	baseItem := Item{FileID: 1, RecordOffset: 100, RecordSize: 40, Timestamp: 1000}
+	newItem := Item{FileID: 0, RecordOffset: 20, RecordSize: 40, Timestamp: 1000}
+
+	tests := []struct {
+		name         string
+		setup        func(idx *MapIndex)
+		key          string
+		expected     Item
+		updated      Item
+		wantSwapped  bool
+		wantFinal    Item
+		wantFinalHit bool
+	}{
+		{
+			name: "swaps when FileID and RecordOffset match",
+			setup: func(idx *MapIndex) {
+				idx.Put("k1", baseItem)
+			},
+			key:          "k1",
+			expected:     Item{FileID: 1, RecordOffset: 100},
+			updated:      newItem,
+			wantSwapped:  true,
+			wantFinal:    newItem,
+			wantFinalHit: true,
+		},
+		{
+			name:         "returns false when key does not exist",
+			setup:        func(idx *MapIndex) {},
+			key:          "missing",
+			expected:     baseItem,
+			updated:      newItem,
+			wantSwapped:  false,
+			wantFinalHit: false,
+		},
+		{
+			name: "returns false when FileID is stale",
+			setup: func(idx *MapIndex) {
+				idx.Put("k1", Item{FileID: 5, RecordOffset: 100, RecordSize: 40, Timestamp: 2000})
+			},
+			key:          "k1",
+			expected:     baseItem,
+			updated:      newItem,
+			wantSwapped:  false,
+			wantFinal:    Item{FileID: 5, RecordOffset: 100, RecordSize: 40, Timestamp: 2000},
+			wantFinalHit: true,
+		},
+		{
+			name: "returns false when RecordOffset is stale",
+			setup: func(idx *MapIndex) {
+				idx.Put("k1", Item{FileID: 1, RecordOffset: 250, RecordSize: 40, Timestamp: 2000})
+			},
+			key:          "k1",
+			expected:     baseItem,
+			updated:      newItem,
+			wantSwapped:  false,
+			wantFinal:    Item{FileID: 1, RecordOffset: 250, RecordSize: 40, Timestamp: 2000},
+			wantFinalHit: true,
+		},
+		{
+			name: "returns false safely after Close",
+			setup: func(idx *MapIndex) {
+				idx.Put("k1", baseItem)
+				_ = idx.Close()
+			},
+			key:          "k1",
+			expected:     baseItem,
+			updated:      newItem,
+			wantSwapped:  false,
+			wantFinalHit: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := NewMapIndex()
+			defer idx.Close()
+
+			tt.setup(idx)
+			got := idx.CompareAndSwap(tt.key, tt.expected, tt.updated)
+			if got != tt.wantSwapped {
+				t.Fatalf("CompareAndSwap() = %v, want %v", got, tt.wantSwapped)
+			}
+
+			finalItem, hit := idx.Get(tt.key)
+			if hit != tt.wantFinalHit {
+				t.Fatalf("Get(%q) hit = %v, want %v", tt.key, hit, tt.wantFinalHit)
+			}
+			if hit && finalItem != tt.wantFinal {
+				t.Fatalf("Get(%q) = %+v, want %+v", tt.key, finalItem, tt.wantFinal)
+			}
+		})
+	}
+}
+
 func TestMapIndex_ConcurrentAccess(t *testing.T) {
 	idx := NewMapIndex()
 	defer idx.Close()

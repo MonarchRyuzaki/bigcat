@@ -24,6 +24,27 @@ func (m *MapIndex) Put(key string, item Item) {
 	m.items[key] = item
 }
 
+// CompareAndSwap updates key to updated only if key currently exists in m.items
+// and matches expected.FileID and expected.RecordOffset.
+func (m *MapIndex) CompareAndSwap(key string, expected, updated Item) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.items == nil {
+		return false
+	}
+
+	cur, ok := m.items[key]
+	if !ok {
+		return false
+	}
+	if cur.FileID != expected.FileID || cur.RecordOffset != expected.RecordOffset {
+		return false
+	}
+	m.items[key] = updated
+	return true
+}
+
 // Get finds an index entry for the given key.
 func (m *MapIndex) Get(key string) (Item, bool) {
 	m.mu.RLock()

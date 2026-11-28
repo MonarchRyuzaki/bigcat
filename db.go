@@ -17,6 +17,7 @@ import (
 // It coordinates append-only multi-file storage on disk with an in-memory KeyDir index.
 type DB struct {
 	mu        sync.RWMutex
+	mergeMu   sync.Mutex // Serializes concurrent Merge() runs so only one .tmp/ compaction runs at a time
 	options   Options
 	storage   *storage.FileManager
 	index     index.Indexer
@@ -26,7 +27,8 @@ type DB struct {
 }
 
 // Open initializes and opens a BigCat storage engine instance in the specified directory.
-// On startup, it scans all data files sequentially in ascending order to rebuild the in-memory KeyDir.
+// On startup, it replays/cleans any interrupted compaction state, then scans all data files
+// sequentially in ascending order to rebuild the in-memory KeyDir.
 func Open(dirPath string, opts ...Option) (*DB, error) {
 	// 1. Initialize Options (apply defaults and user-provided functional options)
 	options := DefaultOptions(dirPath)
@@ -36,6 +38,12 @@ func Open(dirPath string, opts ...Option) (*DB, error) {
 
 	// 2. Ensure data directory exists with standard directory permissions (0755)
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return nil, err
+	}
+
+	// 2.5 Recover or clean up any interrupted compaction state in dirPath/.tmp
+	// BEFORE FileManager opens and discovers *.data files.
+	if err := recoverMergeState(dirPath); err != nil {
 		return nil, err
 	}
 
@@ -174,11 +182,10 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	}
 
 	db.mu.RLock()
+	defer db.mu.RUnlock()
 	if db.isClosed {
-		db.mu.RUnlock()
 		return nil, ErrDatabaseClosed
 	}
-	db.mu.RUnlock()
 
 	// 1. Lookup in-memory index
 	item, exists := db.index.Get(string(key))

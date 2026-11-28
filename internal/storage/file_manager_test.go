@@ -2,7 +2,10 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -401,6 +404,100 @@ func BenchmarkFileManager_ReadAt(b *testing.B) {
 		if _, err := fm.ReadAt(l.fID, l.off, uint32(len(payload))); err != nil {
 			b.Fatalf("ReadAt failed: %v", err)
 		}
+	}
+}
+
+func TestFileManager_SealedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	fm, err := OpenFileManager(dir, 1024)
+	if err != nil {
+		t.Fatalf("OpenFileManager failed: %v", err)
+	}
+	defer fm.Close()
+
+	// Single active file (0) -> no sealed files
+	sealed, active := fm.SealedSnapshot()
+	if len(sealed) != 0 || active != 0 {
+		t.Fatalf("expected sealed=[], active=0; got sealed=%v, active=%d", sealed, active)
+	}
+
+	// Rotate 3 times -> olderFiles=[0, 1, 2], active=3
+	for i := 0; i < 3; i++ {
+		if err := fm.Rotate(); err != nil {
+			t.Fatalf("Rotate %d failed: %v", i, err)
+		}
+	}
+
+	sealed, active = fm.SealedSnapshot()
+	if active != 3 {
+		t.Fatalf("expected active=3, got %d", active)
+	}
+	if !slices.Equal(sealed, []uint32{0, 1, 2}) {
+		t.Fatalf("expected sealed=[0, 1, 2], got %v", sealed)
+	}
+}
+
+func TestFileManager_CloseAndDeleteOlderFiles_And_AdoptOlderFiles(t *testing.T) {
+	dir := t.TempDir()
+	fm, err := OpenFileManager(dir, 50)
+	if err != nil {
+		t.Fatalf("OpenFileManager failed: %v", err)
+	}
+	defer fm.Close()
+
+	// Create files 0, 1, 2 (sealed) and 3 (active)
+	for i := 0; i < 4; i++ {
+		if _, _, err := fm.Write(bytes.Repeat([]byte{byte('a' + i)}, 40)); err != nil {
+			t.Fatalf("Write %d failed: %v", i, err)
+		}
+	}
+
+	sealed, active := fm.SealedSnapshot()
+	if active != 3 || !slices.Equal(sealed, []uint32{0, 1, 2}) {
+		t.Fatalf("unexpected snapshot: sealed=%v active=%d", sealed, active)
+	}
+
+	// Delete 0, 1, 2 plus a missing ID 99 (must succeed idempotently and delete all 3)
+	if err := fm.CloseAndDeleteOlderFiles([]uint32{0, 1, 2, 99}); err != nil {
+		t.Fatalf("CloseAndDeleteOlderFiles failed: %v", err)
+	}
+
+	for _, id := range []uint32{0, 1, 2} {
+		if _, err := os.Stat(filepath.Join(dir, DataFileName(id))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected file %d to be deleted, stat err=%v", id, err)
+		}
+		if _, err := fm.ReadAt(id, 0, 10); !errors.Is(err, ErrFileNotFound) {
+			t.Fatalf("expected ErrFileNotFound for deleted file %d, got %v", id, err)
+		}
+	}
+
+	// Active file 3 must remain intact and readable
+	gotActive, err := fm.ReadAt(3, 0, 40)
+	if err != nil || !bytes.Equal(gotActive, bytes.Repeat([]byte("d"), 40)) {
+		t.Fatalf("active file 3 corrupted or unreadable: err=%v", err)
+	}
+
+	// Create replacement 00000.data externally and adopt it
+	replacement := []byte("compacted_replacement_payload")
+	if err := os.WriteFile(filepath.Join(dir, DataFileName(0)), replacement, 0644); err != nil {
+		t.Fatalf("write replacement failed: %v", err)
+	}
+
+	// Adopting [0, 999] should fail and roll back cleanly without registering 0
+	if err := fm.AdoptOlderFiles([]uint32{0, 999}); err == nil {
+		t.Fatalf("expected AdoptOlderFiles to fail for missing ID 999")
+	}
+	if _, err := fm.ReadAt(0, 0, 5); !errors.Is(err, ErrFileNotFound) {
+		t.Fatalf("expected failed AdoptOlderFiles to roll back ID 0, got %v", err)
+	}
+
+	// Adopting valid [0] should register it cleanly
+	if err := fm.AdoptOlderFiles([]uint32{0}); err != nil {
+		t.Fatalf("AdoptOlderFiles([0]) failed: %v", err)
+	}
+	gotAdopted, err := fm.ReadAt(0, 0, uint32(len(replacement)))
+	if err != nil || !bytes.Equal(gotAdopted, replacement) {
+		t.Fatalf("ReadAt on adopted file 0 mismatch: err=%v, got=%q", err, gotAdopted)
 	}
 }
 
