@@ -14,7 +14,7 @@ Compaction must satisfy four invariants:
 1. **Reclaim disk space & reduce file count:** Merge sparse sealed files (e.g., `00001–00004`) into fewer dense `.data` files packed up to `MaxFileSize`.
 2. **Non-blocking normal traffic:** `Put`, `Delete`, `WriteBatch`, and `Get` must remain unblocked during the heavy disk copy phase; the active file continues accepting writes and rotating normally.
 3. **Crash-safe & idempotent:** A crash or power loss at *any* point during compaction or recovery must never lose live data, resurrect deleted keys, or leave corrupt records behind.
-4. **Preserve startup recovery invariants:** [`OpenFileManager`](../internal/storage/file_manager.go#L75-L142) and [`loadIndexFromDisk`](../db.go#L74-L94) must continue to recover the exact database state without special-case startup replay rules.
+4. **Preserve startup recovery invariants:** [`OpenFileManager`](../internal/storage/file_manager.go#L75-L142) and [`loadIndexFromDisk`](../db.go#L82-L102) must continue to recover the exact database state without special-case startup replay rules.
 
 ---
 
@@ -32,10 +32,18 @@ We evaluated two compaction strategies for a directory with sealed files `00001�
 
 1. **Fragmentation persists:** Rewriting each file individually never consolidates small partially-dead files into full `MaxFileSize` segments, leaving unnecessary open file descriptors and fragmentation.
 2. **The Tombstone Resurrection Trap:**
-   During startup, [`loadIndexFromDisk`](../db.go#L74-L94) replays all `.data` files in ascending `FileID` order, using `RecordTypeTombstone` entries to remove previously seen keys from `KeyDir`.
+   During startup, [`loadIndexFromDisk`](../db.go#L82-L102) replays all `.data` files in ascending `FileID` order, using `RecordTypeTombstone` entries to remove previously seen keys from `KeyDir`.
    * Suppose key `"k"` was written (`Put`) in `00001.data` and deleted (`Tombstone`) in `00003.data`.
    * If `00003.data` were compacted independently and dropped the tombstone while `00001.data` still held the original `Put("k")`, `"k"` would **resurrect on the next `Open()`**.
    * By compacting a **contiguous prefix starting from the oldest sealed file** (`00001–00004`) together, there are **no older files left behind `00004`**. Every tombstone inside `00001–00004` can be safely discarded. *(If `"k"` was deleted in active file `00005`, `KeyDir` has no `"k"`, so any older `Put("k")` in `00001–00004` is skipped while `00005`'s tombstone stays until `00005` is later sealed and compacted.)*
+
+### Why We Check `db.index` Directly (Instead of Building a Separate `mergeMap`)
+
+During Phase 2, compaction filters records by querying `db.index.Get(key)` rather than building a second in-memory hash map over `00001–00004`:
+1. **No write contention:** `MapIndex.Get()` only takes `RLock()` (~12 ns, 0 allocations), so it never blocks concurrent `DB.Get()` readers.
+2. **One sequential pass:** As records stream from a 256KB buffered reader, we already have `(Key, Value)` in memory—no second pass or random `ReadAt` seeks required.
+3. **Half the RAM:** Avoids duplicating `KeyDir` in memory.
+4. **Sees active-file updates/deletes:** Keys overwritten or deleted in `00005` are skipped immediately instead of being copied unnecessarily.
 
 ---
 
@@ -43,7 +51,7 @@ We evaluated two compaction strategies for a directory with sealed files `00001�
 
 BigCat's storage layer enforces two strict ordering rules:
 1. [`OpenFileManager`](../internal/storage/file_manager.go#L117-L139) sorts all `*.data` files ascending and opens the **highest** `FileID` as `activeFile` (read-write).
-2. [`loadIndexFromDisk`](../db.go#L74-L94) replays files in **ascending `FileID` order**, where later records overwrite earlier ones.
+2. [`loadIndexFromDisk`](../db.go#L82-L102) replays files in **ascending `FileID` order**, where later records overwrite earlier ones.
 
 ### Why New Higher `FileID`s (`00006.data`) Would Corrupt Data
 If `00005.data` is active and compacted output were written to `00006.data`:
@@ -59,14 +67,14 @@ Compacted output files reuse `FileID`s **strictly smaller than the active file's
 
 ## 4. Compaction Lifecycle (4 Phases)
 
-Compaction is serialized via a dedicated `mergeMu` (preventing concurrent `Merge()` runs) and executed in four phases using a hidden staging directory `data_dir/.tmp/`:
+Compaction is serialized via `db.mergeMu` (preventing concurrent `Merge()` runs) and executed in four phases using a hidden staging directory `data_dir/.tmp/`:
 
 ```text
 data_dir/
 ├── .tmp/                    # Ignored by OpenFileManager (subdirectories are skipped)
 │   ├── 00001.data           # Newly compacted output file(s)
 │   ├── 00002.data
-│   ├── manifest             # Lists old_ids=[1,2,3,4] and new_ids=[1,2]
+│   ├── manifest.json        # Lists old_ids=[1,2,3,4] and new_ids=[1,2]
 │   ├── COMMITTED            # Durable commit marker (point of no return)
 │   └── OLD_DELETED          # Marker written once old_ids are unlinked
 ├── 00001.data               # Original sealed files (untouched until Phase 4)
@@ -78,21 +86,20 @@ data_dir/
 > **Note:** [`OpenFileManager`](../internal/storage/file_manager.go#L87-L89) ignores subdirectories (`if item.IsDir() { continue }`), so `.tmp/` never interferes with normal file discovery.
 
 ### Phase 1: Snapshot Target Set (Instant)
-* Read `storage.FileIDs()` and collect all sealed file IDs strictly less than `activeFile.FileID()` (e.g., `old_ids = [1, 2, 3, 4]`).
-* If `len(old_ids) == 0`, return `nil` (nothing to compact).
+* [`SealedSnapshot`](../internal/storage/file_manager.go#L242-L256) returns all sealed file IDs sorted ascending (`oldIDs`) and the current active file ID (`activeStartID`).
+* If `len(oldIDs) == 0`, `Merge()` returns `nil` (nothing to compact).
 * `00005.data` (and any new files `00006+` created by rotation during compaction) are excluded from this run.
 
 ### Phase 2: Offline Copy & Staging (Heavy I/O, Non-Blocking)
-* Create `data_dir/.tmp/`.
-* Scan `old_ids` (`00001` -> `00004`) sequentially using buffered I/O:
+* Wipe any stale `.tmp/` and recreate `data_dir/.tmp/`.
+* Scan `oldIDs` sequentially using a 256KB `bufio.Reader`:
   * For each record decoded at `(srcFileID, srcOffset)`:
     * Skip tombstones (`RecordTypeTombstone`).
     * Query `db.index.Get(string(rec.Key))`.
     * Keep the record **only if** `exists && item.FileID == srcFileID && item.RecordOffset == srcOffset`.
-    * Re-encode/copy the raw record into the current `.tmp/` output file (rolling to the next ID when `size + recordLen > MaxFileSize`, capped strictly `< activeStartID`).
-    * Append `(key, srcFileID, srcOffset, dstFileID, dstOffset, recordSize, timestamp)` to an in-memory `relocations` list.
-* `fsync()` every created `.tmp/*.data` file.
-* Write `.tmp/manifest` (recording `old_ids` and `new_ids`), `fsync()` it, and `fsync(.tmp/)`.
+    * Re-encode via `db.codec.Encode(rec)` (preserving `rec.Timestamp`) and append into `.tmp/` via `mergeWriter` (which reuses [`storage.DataFile`](../internal/storage/file.go#L10-L15) and rotates through `oldIDs` slots at `MaxFileSize`, capped `< activeStartID`).
+    * Append `(key, oldFileID, oldOffset, newItem)` to an in-memory `relocations` list.
+* `finish()` `fsync`s and closes the final staged `DataFile`.
 
 #### Why We Do NOT Resume Phase 2 Mid-Copy After a Crash
 We explicitly chose **not** to track `(srcFileID, srcOffset)` checkpoints to resume Phase 2 after a crash:
@@ -103,61 +110,107 @@ We explicitly chose **not** to track `(srcFileID, srcOffset)` checkpoints to res
 Because `00001–00004` are completely unmodified during Phase 2, discarding `.tmp/` before commit is simple, instant, and zero-risk.
 
 ### Phase 3: Durable Commit Point
-* Atomically create `.tmp/COMMITTED` (write `.tmp/COMMITTED.tmp` -> `fsync` -> `os.Rename` to `.tmp/COMMITTED`) and `fsync(.tmp/)`.
+* [`commitMerge`](../merge.go#L296-L308) atomically writes `.tmp/manifest.json` (`old_ids`, `new_ids`) + `syncDir`, then atomically creates `.tmp/COMMITTED` + `syncDir`.
 * **This is the durability boundary:**
   * Crash *before* `COMMITTED` exists -> roll back by deleting `.tmp/`.
   * Crash *after* `COMMITTED` exists -> roll forward on next `Open()`.
 
 ### Phase 4: Atomic Memory & Disk Swap (Brief Lock)
-Because `new_ids` reuse IDs from `old_ids` (`1, 2` overlap `[1, 2, 3, 4]`), **updating `KeyDir`, updating `FileManager`, deleting old files, and moving new files into place must appear atomic to concurrent `Get()` and `GroupCommitter.flushBatch()` calls.**
+Because `new_ids` reuse IDs from `old_ids` (`1, 2` overlap `[1, 2, 3, 4]`), **deleting old files, moving new files into place, registering them in `FileManager`, and updating `KeyDir` must appear atomic to concurrent `Get()` and `GroupCommitter.flushBatch()` calls.**
 
-Acquire `db.mu.Lock()` (no bulk copying or data `fsync`s remain—only fast pointer swaps and directory metadata updates):
+[`applyCompactionSwap`](../merge.go#L313-L358) acquires `db.mu.Lock()` (no bulk copying or data `fsync`s remain—only fast pointer swaps and directory metadata updates):
 
-1. **Conditionally update `KeyDir`:**
-   For each entry in `relocations`, update `KeyDir` to `(dstFileID, dstOffset)` **only if** `KeyDir` still points to `(srcFileID, srcOffset)`. Any key overwritten or deleted in `00005+` during Phase 2 has a different `FileID`/`RecordOffset` (or is absent) and is left untouched.
-2. **Close and unlink `old_ids`:**
-   Remove `old_ids` from `FileManager.olderFiles`, close their `*DataFile` handles, and `os.Remove` `00001–00004.data` from `data_dir/`.
-3. **Record `OLD_DELETED` marker:**
-   Create and `fsync` `.tmp/OLD_DELETED` (and `fsync(.tmp/)`).
-   * *Why `OLD_DELETED` is required:* If a crash occurs *after* moving `.tmp/00001.data -> data_dir/00001.data` and *before* moving `.tmp/00002.data`, recovery must **not** re-run step 2 (`delete old_ids [1,2,3,4]`), or it would delete the newly moved `00001.data`. `OLD_DELETED` guarantees recovery jumps straight to moving remaining `new_ids`.
-4. **Move & register `new_ids`:**
-   For each ID in `new_ids`, `os.Rename` `.tmp/<id>.data` -> `data_dir/<id>.data`, open it read-only via `OpenDataFileWithMode(..., true)`, and insert it into `FileManager.olderFiles`.
+1. **Close and unlink `old_ids`:**
+   [`CloseAndDeleteOlderFiles`](../internal/storage/file_manager.go#L261-L279) removes `oldIDs` from `FileManager.olderFiles`, closes their `*DataFile` handles, and removes `00001–00004.data` from `data_dir/`.
+2. **Record `OLD_DELETED` marker:**
+   Atomically create `.tmp/OLD_DELETED` and `syncDir(.tmp)`.
+   * *Why `OLD_DELETED` is required:* If a crash occurs *after* moving `.tmp/00001.data -> data_dir/00001.data` and *before* moving `.tmp/00002.data`, recovery must **not** re-run step 1 (`delete old_ids [1,2,3,4]`), or it would delete the newly moved `00001.data`. `OLD_DELETED` guarantees recovery jumps straight to moving remaining `new_ids`.
+3. **Move & register `new_ids`:**
+   For each ID in `newIDs`, `os.Rename` `.tmp/<id>.data` -> `data_dir/<id>.data`, then call [`AdoptOlderFiles`](../internal/storage/file_manager.go#L284-L311) to open them read-only and register them in `FileManager.olderFiles`.
+4. **Conditionally update `KeyDir`:**
+   For each entry in `relocations`, call [`CompareAndSwap`](../internal/index/map.go#L29-L46) (`expected = {oldFileID, oldOffset}`, `updated = newItem`). Any key overwritten or deleted in `00005+` during Phase 2 has a different `FileID`/`RecordOffset` (or is absent) and is left untouched. Updating `KeyDir` after `AdoptOlderFiles` succeeds also guarantees `KeyDir` never points at un-adopted files if an OS error interrupts steps 1–3.
 5. **Finalize:**
-   `fsync(data_dir)` so directory entries are durable, remove `.tmp/`, and release `db.mu.Unlock()`.
+   `syncDir(data_dir)`, remove `.tmp/`, and release `db.mu.Unlock()`.
 
 At this point, `Merge()` is complete and returns `nil`.
 
 ---
 
-## 5. Crash Recovery Matrix (`Open()`)
+## 5. End-to-End Walkthrough Example
 
-Before calling [`OpenFileManager`](../internal/storage/file_manager.go#L75), [`Open`](../db.go#L30) checks `data_dir/.tmp/`:
+Suppose `MaxFileSize = 100 bytes` and we start with **3 files**:
+
+* **`00000.data`** *(sealed)*
+  * offset `0`: `Put("a", "old_a")` (30B)
+  * offset `30`: `Put("b", "val_b")` (30B)
+  * offset `60`: `Put("c", "val_c")` (30B)
+* **`00001.data`** *(sealed)*
+  * offset `0`: `Put("a", "mid_a")` (30B) — *overwrote `"a"`*
+  * offset `30`: `Tombstone("b")` (22B) — *deleted `"b"`*
+  * offset `52`: `Put("d", "val_d")` (30B)
+* **`00002.data`** *(active — receiving live writes)*
+  * offset `0`: `Put("a", "new_a")` (30B) — *overwrote `"a"` again*
+
+In RAM, **`KeyDir` (`db.index`)** currently maps:
+* `"a"` -> `(FileID: 2, Offset: 0)`
+* `"c"` -> `(FileID: 0, Offset: 60)`
+* `"d"` -> `(FileID: 1, Offset: 52)`
+* *(`"b"` is absent because it was deleted.)*
+
+Now `db.Merge()` runs:
+
+1. **Phase 1 (Snapshot):** `SealedSnapshot()` freezes `oldIDs = [0, 1]` and `activeStartID = 2`. `00002.data` keeps accepting writes normally.
+2. **Phase 2 (Scan & Stage into `.tmp/`):**
+   * Scanning `00000.data`:
+     * `"a"` at `(0, 0)`: `KeyDir["a"]` is `(2, 0)` != `(0, 0)` -> **Skip** (stale).
+     * `"b"` at `(0, 30)`: `KeyDir["b"]` missing -> **Skip** (deleted).
+     * `"c"` at `(0, 60)`: `KeyDir["c"]` is `(0, 60)` -> **Match!** Written to `.tmp/00000.data` at offset `0` (30B). Relocation recorded: `"c": (0, 60) -> (0, 0)`.
+   * Scanning `00001.data`:
+     * `"a"` at `(1, 0)`: `KeyDir["a"]` is `(2, 0)` != `(1, 0)` -> **Skip** (stale).
+     * `Tombstone("b")` at `(1, 30)`: **Skip** (safe because everything from `0` up to `1` is compacted—no older `Put("b")` exists behind `1`).
+     * `"d"` at `(1, 52)`: `KeyDir["d"]` is `(1, 52)` -> **Match!** `30 + 30 = 60 <= 100`, so it fits into `.tmp/00000.data` at offset `30`. Relocation recorded: `"d": (1, 52) -> (0, 30)`.
+   * **Concurrent write during Phase 2:** Meanwhile, a client calls `db.Put("c", "brand_new_c")`. `GroupCommitter` appends it to active `00002.data` at offset `30` and updates `KeyDir["c"] = (2, 30)`.
+   * `writer.finish()` syncs and closes `.tmp/00000.data`, returning `newIDs = [0]`. Two files totaling 172B shrank into one 60B file.
+3. **Phase 3 (Commit):** Writes `.tmp/manifest.json` (`old_ids: [0, 1]`, `new_ids: [0]`) and `.tmp/COMMITTED`.
+4. **Phase 4 (Swap under `db.mu.Lock()`):**
+   * Closes & unlinks `00000.data` and `00001.data`.
+   * Writes `.tmp/OLD_DELETED`.
+   * Renames `.tmp/00000.data -> data_dir/00000.data` and registers it via `AdoptOlderFiles([0])`.
+   * Updates `KeyDir`:
+     * `CompareAndSwap("c", expected=(0, 60), updated=(0, 0))` sees `(2, 30)` != `(0, 60)` -> **Skips!** (`"c"` keeps `"brand_new_c"` in `00002.data`.)
+     * `CompareAndSwap("d", expected=(1, 52), updated=(0, 30))` sees `(1, 52)` == `(1, 52)` -> **Swaps!** (`"d"` now points to `(0, 30)` in new `00000.data`.)
+   * Syncs `data_dir` and removes `.tmp/`.
+
+**Result:** Disk holds `00000.data` (60B, sealed) and `00002.data` (60B, active); `00001.data` is reclaimed; `KeyDir` maps `"a" -> (2, 0)`, `"c" -> (2, 30)`, `"d" -> (0, 30)`. On reboot, `Open()` scans `00000.data` then `00002.data`, producing the exact same state.
+
+---
+
+## 6. Crash Recovery Matrix (`Open()`)
+
+Before calling [`OpenFileManager`](../internal/storage/file_manager.go#L75), [`Open`](../db.go#L32-L49) runs [`recoverMergeState`](../merge.go#L362-L420) to inspect `data_dir/.tmp/`:
 
 | Disk State on Startup | When Crash Happened | Recovery Action (Idempotent) |
 |---|---|---|
 | No `.tmp/` directory | Normal shutdown / no compaction | Proceed straight to `OpenFileManager` |
 | `.tmp/` exists, no `COMMITTED` | During Phase 1 or Phase 2 | `os.RemoveAll(".tmp")` (originals `001–004` intact) |
-| `COMMITTED` exists, no `OLD_DELETED` | Right after commit or mid-unlink of `001–004` | Read `manifest`, delete any remaining `old_ids` in `data_dir/`, create & `fsync` `OLD_DELETED`, then execute the row below |
-| `OLD_DELETED` exists | Mid-move of `.tmp/` -> `data_dir/` or before `.tmp/` cleanup | Read `manifest`, move any remaining `new_ids` from `.tmp/` into `data_dir/`, `fsync(data_dir)`, `os.RemoveAll(".tmp")` |
+| `COMMITTED` exists, no `OLD_DELETED` | Right after commit or mid-unlink of `001–004` | Read `manifest.json`, delete any remaining `old_ids` in `data_dir/`, create & `fsync` `OLD_DELETED`, then execute the row below |
+| `OLD_DELETED` exists | Mid-move of `.tmp/` -> `data_dir/` or before `.tmp/` cleanup | Read `manifest.json`, move any remaining `new_ids` from `.tmp/` into `data_dir/`, `fsync(data_dir)`, `os.RemoveAll(".tmp")` |
 
 Every recovery transition is idempotent across repeated crashes during recovery.
 
 ---
 
-## 6. Concurrency Adjustments Required in Existing Code
+## 7. Concurrency Guarantees
 
-Implementing compaction safely requires two targeted updates to the existing concurrency paths:
-
-1. **Fix TOCTOU Race in [`DB.Get`](../db.go#L171-L207):**
-   Currently, [`DB.Get`](../db.go#L176-L193) acquires and immediately releases `db.mu.RLock()` *before* calling `db.index.Get()` and `db.storage.ReadAt()`. Once Phase 4 can swap `olderFiles` and reuse IDs, a `Get` paused between `index.Get` and `ReadAt` could hit `ErrFileNotFound` or read the wrong offset in a newly swapped file.
-   * **Fix:** Hold `db.mu.RLock()` across `index.Get` + `storage.ReadAt` (all concurrent `Get`s still run in parallel under `RLock`, while [`GroupCommitter.flushBatch`](../committer.go#L168-L205) and Phase 4 acquire `db.mu.Lock()`).
-2. **Conditional Index Update ([`Indexer`](../internal/index/index.go#L23-L41)):**
-   Add an atomic `CompareAndSwap(key string, expected, updated Item) bool` method (or perform check-and-update under `db.mu.Lock()` while `flushBatch` is paused) so stale Phase 2 relocations can never clobber concurrent writes from `00005+`.
+1. **Reader Safety in [`DB.Get`](../db.go#L179-L210):**
+   `DB.Get` holds `db.mu.RLock()` across both `db.index.Get` and `db.storage.ReadAt`. All concurrent `Get()` callers run in parallel under `RLock`, while [`GroupCommitter.flushBatch`](../committer.go#L168-L205) and Phase 4 acquire `db.mu.Lock()`—preventing a TOCTOU race where a reader sees a `FileID` that gets deleted or swapped before `ReadAt` runs.
+2. **Conditional Index Updates ([`MapIndex.CompareAndSwap`](../internal/index/map.go#L29-L46)):**
+   Checks `cur.FileID == expected.FileID && cur.RecordOffset == expected.RecordOffset` under `m.mu.Lock()` before swapping, ensuring Phase 2 relocations never overwrite concurrent writes or deletes from `00005+`.
 
 ---
 
-## 7. Edge Cases
+## 8. Edge Cases
 
-* **Zero surviving keys:** If every key in `00001–00004` was overwritten in `00005` or deleted, `new_ids` in `.tmp/manifest` is empty (`[]`). Phase 4 deletes `00001–00004`, leaves `00005` as the sole file, and removes `.tmp/`.
-* **`MaxFileSize` shrunk across restarts:** If `00001–00004` were originally created with `MaxFileSize = 64MB` and the DB is later reopened with `1MB`, splitting surviving data strictly at `1MB` could require more than 4 output files and collide with `00005`. Compaction must cap output `FileID` rotation strictly below `activeStartID` (once the last available ID `activeStartID - 1` is reached, keep appending to it instead of rotating past `activeStartID`).
+* **Zero surviving keys:** If every key in `00001–00004` was overwritten in `00005` or deleted, `new_ids` in `.tmp/manifest.json` is empty (`[]`). Phase 4 deletes `00001–00004`, leaves `00005` as the sole file, and removes `.tmp/`.
+* **`MaxFileSize` shrunk across restarts:** If `00001–00004` were originally created with `MaxFileSize = 64MB` and the DB is later reopened with `1MB`, splitting surviving data strictly at `1MB` could require more than 4 output files and collide with `00005`. [`mergeWriter`](../merge.go#L199-L291) caps rotation to the slots in `oldIDs` (`< activeStartID`), continuing to append to the final slot instead of allocating an ID `>= activeStartID`.
 * **Single file only (`len(olderFiles) == 0`):** If only the active file exists, `Merge()` returns `nil` as a no-op (or callers may explicitly `Rotate()` beforehand if they wish to compact the current active file).

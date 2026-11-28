@@ -1,10 +1,18 @@
 package bigcat
 
 import (
+	"bufio"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"syscall"
 
 	"bigcat/internal/index"
+	"bigcat/internal/record"
+	"bigcat/internal/storage"
 )
 
 const (
@@ -46,82 +54,157 @@ type relocation struct {
 //
 // See docs/COMPACTION.md for the full 4-phase lifecycle and crash-recovery guarantees.
 func (db *DB) Merge() error {
-	// TODO(compaction): Implement the 4-phase compaction orchestrator:
-	//
-	// 0. Guard & serialize:
-	//    - Check db.isClosed under db.mu.RLock(); return ErrDatabaseClosed if closed.
-	//    - Acquire db.mergeMu.Lock() and defer db.mergeMu.Unlock() so only one Merge runs at a time.
-	//    - Re-check db.isClosed after acquiring mergeMu.
-	//
-	// 1. Phase 1 — Snapshot Target Set:
-	//    - Call oldIDs, activeStartID := db.storage.SealedSnapshot()
-	//    - If len(oldIDs) == 0, return nil (nothing to compact).
-	//
-	// 2. Phase 2 — Offline Copy & Staging (outside db.mu!):
-	//    - Build tmpDir := filepath.Join(db.options.DirPath, mergeTempDirName).
-	//    - Call relocations, newIDs, err := db.stageMergedFiles(tmpDir, oldIDs, activeStartID).
-	//    - If err != nil: clean up with os.RemoveAll(tmpDir) and return err.
-	//      (Originals are untouched, so failure before Phase 3 rolls back cleanly.)
-	//
-	// 3. Phase 3 — Durable Commit Point:
-	//    - Call err = commitMerge(tmpDir, oldIDs, newIDs).
-	//    - If err != nil: clean up with os.RemoveAll(tmpDir) and return err.
-	//      (Once COMMITTED is fsynced, we MUST NOT delete tmpDir on failure; it will roll forward.)
-	//
-	// 4. Phase 4 — Atomic Memory & Disk Swap:
-	//    - Return db.applyCompactionSwap(tmpDir, oldIDs, newIDs, relocations).
-	return errors.New("merge: not implemented")
+	db.mu.RLock()
+	closed := db.isClosed
+	db.mu.RUnlock()
+	if closed {
+		return ErrDatabaseClosed
+	}
+
+	// Serialize concurrent Merge() calls so only one .tmp staging directory exists at a time.
+	db.mergeMu.Lock()
+	defer db.mergeMu.Unlock()
+
+	db.mu.RLock()
+	closed = db.isClosed
+	db.mu.RUnlock()
+	if closed {
+		return ErrDatabaseClosed
+	}
+
+	// Phase 1: Snapshot sealed files at start; active file and future rotations remain untouched.
+	oldIDs, activeStartID := db.storage.SealedSnapshot()
+	if len(oldIDs) == 0 {
+		return nil
+	}
+
+	tmpDir := filepath.Join(db.options.DirPath, mergeTempDirName)
+
+	// Phase 2: Offline sequential copy & filtering into .tmp/ without holding db.mu.
+	relocations, newIDs, err := db.stageMergedFiles(tmpDir, oldIDs, activeStartID)
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return err
+	}
+
+	// Abort before committing if the database was closed while Phase 2 was running.
+	db.mu.RLock()
+	closed = db.isClosed
+	db.mu.RUnlock()
+	if closed {
+		_ = os.RemoveAll(tmpDir)
+		return ErrDatabaseClosed
+	}
+
+	// Phase 3: Durable commit point (manifest + COMMITTED marker).
+	if err := commitMerge(tmpDir, oldIDs, newIDs); err != nil {
+		if !fileExists(filepath.Join(tmpDir, mergeCommittedMarker)) {
+			_ = os.RemoveAll(tmpDir)
+		}
+		return err
+	}
+
+	// Phase 4: Brief atomic swap of files and KeyDir pointers under db.mu.Lock().
+	return db.applyCompactionSwap(tmpDir, oldIDs, newIDs, relocations)
 }
 
 // stageMergedFiles streams every sealed file in oldIDs sequentially, filters out obsolete
 // records and tombstones by checking db.index.Get, writes surviving records into tmpDir,
 // and fsyncs all generated files.
 func (db *DB) stageMergedFiles(tmpDir string, oldIDs []uint32, activeStartID uint32) ([]relocation, []uint32, error) {
-	// TODO(compaction):
-	// 1. Remove any stale tmpDir (os.RemoveAll(tmpDir)), then os.MkdirAll(tmpDir, 0755).
-	// 2. Initialize writer := newMergeWriter(tmpDir, oldIDs, db.options.MaxFileSize, activeStartID).
-	// 3. Initialize var relocations []relocation.
-	// 4. For each srcFileID in oldIDs (already sorted ascending):
-	//    a. Open filepath.Join(db.options.DirPath, storage.DataFileName(srcFileID)) for sequential read.
-	//    b. Wrap in bufio.NewReaderSize(file, 256*1024) and track currentOffset := int64(0).
-	//    c. Loop calling rec, err := db.codec.Decode(reader) until io.EOF (return any other error).
-	//    d. Compute recordSize := uint32(record.HeaderSize + len(rec.Key) + len(rec.Value)).
-	//    e. Only if rec.Type == record.RecordTypeNormal:
-	//       - Lookup item, exists := db.index.Get(string(rec.Key)).
-	//       - Keep ONLY if exists && item.FileID == srcFileID && item.RecordOffset == currentOffset.
-	//       - Re-encode with db.codec.Encode(rec) (preserves rec.Timestamp) or copy raw bytes.
-	//       - Call dstFileID, dstOffset, err := writer.writeRecord(encoded).
-	//       - Append relocation{
-	//             key:       string(rec.Key),
-	//             oldFileID: srcFileID,
-	//             oldOffset: currentOffset,
-	//             newItem: index.Item{
-	//                 FileID:       dstFileID,
-	//                 RecordOffset: dstOffset,
-	//                 RecordSize:   uint32(len(encoded)),
-	//                 Timestamp:    rec.Timestamp,
-	//             },
-	//         }.
-	//    f. Advance currentOffset += int64(recordSize) and close the source file when done.
-	// 5. Call newIDs, err := writer.finish() (syncs & closes all staged .data files).
-	//    Note: len(newIDs) can be 0 if all keys in oldIDs were deleted or overwritten in active files!
-	// 6. Return relocations, newIDs, nil.
-	return nil, nil, nil
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return nil, nil, err
+	}
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return nil, nil, err
+	}
+
+	writer := newMergeWriter(tmpDir, oldIDs, db.options.MaxFileSize, activeStartID)
+	var relocations []relocation
+
+	for _, srcFileID := range oldIDs {
+		srcPath := filepath.Join(db.options.DirPath, storage.DataFileName(srcFileID))
+		f, err := os.Open(srcPath)
+		if err != nil {
+			writer.abort()
+			return nil, nil, err
+		}
+
+		// cant we just reuse the reader for each allocation ? instead of creating a buffer for each id ?
+		reader := bufio.NewReaderSize(f, 256*1024)
+		var currentOffset int64
+
+		for {
+			rec, err := db.codec.Decode(reader)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				_ = f.Close()
+				writer.abort()
+				return nil, nil, err
+			}
+
+			recordSize := uint32(record.HeaderSize + len(rec.Key) + len(rec.Value))
+
+			if rec.Type == record.RecordTypeNormal {
+				keyStr := string(rec.Key)
+				item, exists := db.index.Get(keyStr)
+				if exists && item.FileID == srcFileID && item.RecordOffset == currentOffset {
+					encoded, err := db.codec.Encode(rec)
+					if err != nil {
+						_ = f.Close()
+						writer.abort()
+						return nil, nil, err
+					}
+
+					dstFileID, dstOffset, err := writer.writeRecord(encoded)
+					if err != nil {
+						_ = f.Close()
+						writer.abort()
+						return nil, nil, err
+					}
+
+					relocations = append(relocations, relocation{
+						key:       keyStr,
+						oldFileID: srcFileID,
+						oldOffset: currentOffset,
+						newItem: index.Item{
+							FileID:       dstFileID,
+							RecordOffset: dstOffset,
+							RecordSize:   uint32(len(encoded)),
+							Timestamp:    rec.Timestamp,
+						},
+					})
+				}
+			}
+
+			currentOffset += int64(recordSize)
+		}
+
+		if err := f.Close(); err != nil {
+			writer.abort()
+			return nil, nil, err
+		}
+	}
+
+	newIDs, err := writer.finish()
+	if err != nil {
+		return nil, nil, err
+	}
+	return relocations, newIDs, nil
 }
 
-// mergeWriter writes surviving compacted records into sequential .data files inside tmpDir.
-// It rotates files at maxFileSize while capping output FileIDs strictly below activeStartID.
+// mergeWriter writes surviving compacted records into sequential storage.DataFile segments
+// inside tmpDir, rotating at maxFileSize while capping FileIDs strictly below activeStartID.
 type mergeWriter struct {
 	tmpDir        string
 	idSlots       []uint32 // Reuses oldIDs slots (guarantees every dstID < activeStartID)
 	slotIdx       int
 	maxFileSize   int64
 	activeStartID uint32
-
-	currFile   *os.File
-	currID     uint32
-	currOffset int64
-	createdIDs []uint32
+	currFile      *storage.DataFile
+	createdIDs    []uint32
 }
 
 func newMergeWriter(tmpDir string, idSlots []uint32, maxFileSize int64, activeStartID uint32) *mergeWriter {
@@ -133,108 +216,272 @@ func newMergeWriter(tmpDir string, idSlots []uint32, maxFileSize int64, activeSt
 	}
 }
 
-// writeRecord appends an encoded record to the current staged .data file, rotating to the
-// next slot in idSlots when currOffset > 0 and currOffset + len(encoded) > maxFileSize.
+func (w *mergeWriter) openSlot(idx int) error {
+	if idx < 0 || idx >= len(w.idSlots) {
+		return errors.New("merge: no output file ID slots available")
+	}
+
+	id := w.idSlots[idx]
+	if id >= w.activeStartID {
+		return fmt.Errorf("merge: compacted file ID %d must be < active file ID %d", id, w.activeStartID)
+	}
+
+	path := filepath.Join(w.tmpDir, storage.DataFileName(id))
+	df, err := storage.OpenDataFileWithMode(path, id, false)
+	if err != nil {
+		return err
+	}
+
+	w.currFile = df
+	w.slotIdx = idx
+	w.createdIDs = append(w.createdIDs, id)
+	return nil
+}
+
+// writeRecord appends an encoded record to the current staged DataFile, rotating to the
+// next slot in idSlots when size > 0 and size + len(encoded) > maxFileSize.
 func (w *mergeWriter) writeRecord(encoded []byte) (fileID uint32, offset int64, err error) {
-	// TODO(compaction):
-	// 1. If w.currFile == nil: open the first slot w.idSlots[0] in w.tmpDir
-	//    (os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644), record it in w.createdIDs.
-	// 2. Else if w.currOffset > 0 && w.currOffset+int64(len(encoded)) > w.maxFileSize && w.slotIdx+1 < len(w.idSlots):
-	//    - Sync and close w.currFile.
-	//    - Advance w.slotIdx++, open next w.idSlots[w.slotIdx] (guaranteed < w.activeStartID),
-	//      reset w.currOffset = 0, and append new ID to w.createdIDs.
-	//    (Note: if we are on the final slot w.slotIdx == len(w.idSlots)-1, e.g. because MaxFileSize
-	//    was reduced across restarts, keep appending to it so we never allocate an ID >= activeStartID.)
-	// 3. Write encoded bytes to w.currFile, record startOff := w.currOffset, increment w.currOffset += int64(n).
-	// 4. Return w.currID, startOff, nil.
-	return 0, 0, nil
+	if w.currFile == nil {
+		if err := w.openSlot(0); err != nil {
+			return 0, 0, err
+		}
+	} else if size := w.currFile.Size(); size > 0 && size+int64(len(encoded)) > w.maxFileSize && w.slotIdx+1 < len(w.idSlots) {
+		if err := w.currFile.Sync(); err != nil {
+			return 0, 0, err
+		}
+		if err := w.currFile.Close(); err != nil {
+			w.currFile = nil
+			return 0, 0, err
+		}
+		w.currFile = nil
+
+		if err := w.openSlot(w.slotIdx + 1); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	offset, err = w.currFile.Write(encoded)
+	if err != nil {
+		return 0, 0, err
+	}
+	return w.currFile.FileID(), offset, nil
 }
 
 // finish fsyncs and closes the final open staged file and returns all created FileIDs.
-// On error, it should close any open handle before returning.
 func (w *mergeWriter) finish() ([]uint32, error) {
-	// TODO(compaction):
-	// 1. If w.currFile != nil: call w.currFile.Sync(), then w.currFile.Close(), set w.currFile = nil.
-	// 2. Return w.createdIDs, nil.
-	return nil, nil
+	if w.currFile != nil {
+		syncErr := w.currFile.Sync()
+		closeErr := w.currFile.Close()
+		w.currFile = nil
+		if syncErr != nil {
+			return nil, syncErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+	}
+	return w.createdIDs, nil
+}
+
+// abort closes any open staged file without syncing on error cleanup paths.
+func (w *mergeWriter) abort() {
+	if w.currFile != nil {
+		_ = w.currFile.Close()
+		w.currFile = nil
+	}
 }
 
 // commitMerge writes manifest.json and atomically creates the COMMITTED marker in tmpDir.
 // After this returns nil, any crash must roll forward rather than discarding tmpDir.
 func commitMerge(tmpDir string, oldIDs, newIDs []uint32) error {
-	// TODO(compaction):
-	// 1. Write mergeManifest{OldIDs: oldIDs, NewIDs: newIDs} to filepath.Join(tmpDir, mergeManifestFile)
-	//    atomically (write temp file -> Sync -> Close -> os.Rename) and fsync tmpDir.
-	// 2. Atomically create filepath.Join(tmpDir, mergeCommittedMarker)
-	//    (write "COMMITTED.tmp" -> Sync -> Close -> os.Rename) and fsync tmpDir.
-	return nil
+	manifestPath := filepath.Join(tmpDir, mergeManifestFile)
+	if err := writeManifest(manifestPath, mergeManifest{OldIDs: oldIDs, NewIDs: newIDs}); err != nil {
+		return err
+	}
+	if err := syncDir(tmpDir); err != nil {
+		return err
+	}
+	if err := createMarkerAtomic(tmpDir, mergeCommittedMarker); err != nil {
+		return err
+	}
+	return syncDir(tmpDir)
 }
 
-// applyCompactionSwap performs Phase 4 under db.mu.Lock(): updates KeyDir pointers via
-// CompareAndSwap, deletes old sealed files, marks OLD_DELETED, moves compacted files into
-// DirPath, adopts them into FileManager, and removes tmpDir.
+// applyCompactionSwap performs Phase 4 under db.mu.Lock(): deletes old sealed files,
+// marks OLD_DELETED, moves compacted files into DirPath, adopts them into FileManager,
+// conditionally updates KeyDir pointers via CompareAndSwap, and removes tmpDir.
 func (db *DB) applyCompactionSwap(tmpDir string, oldIDs, newIDs []uint32, relocations []relocation) error {
-	// TODO(compaction):
-	// 1. Acquire db.mu.Lock() and defer db.mu.Unlock().
-	// 2. If db.isClosed, return ErrDatabaseClosed.
-	//
-	// 3. Update KeyDir conditionally:
-	//    For each r in relocations:
-	//      expected := index.Item{FileID: r.oldFileID, RecordOffset: r.oldOffset}
-	//      db.index.CompareAndSwap(r.key, expected, r.newItem)
-	//
-	// 4. Close and unlink old uncompacted files:
-	//    Call db.storage.CloseAndDeleteOlderFiles(oldIDs).
-	//
-	// 5. Write & fsync OLD_DELETED marker in tmpDir (so crash recovery knows oldIDs are gone
-	//    and won't delete newly moved files that happen to share the same FileIDs):
-	//    Create mergeOldDeletedMarker atomically + syncDir(tmpDir).
-	//
-	// 6. Move compacted files from tmpDir into db.options.DirPath:
-	//    For each id in newIDs:
-	//      os.Rename(filepath.Join(tmpDir, storage.DataFileName(id)),
-	//                filepath.Join(db.options.DirPath, storage.DataFileName(id)))
-	//
-	// 7. Register new compacted files into FileManager.olderFiles:
-	//    Call db.storage.AdoptOlderFiles(newIDs).
-	//
-	// 8. Persist directory entries and clean up staging directory:
-	//    Call syncDir(db.options.DirPath), then os.RemoveAll(tmpDir).
-	return nil
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.isClosed {
+		return ErrDatabaseClosed
+	}
+
+	// 1. Close and unlink old uncompacted files.
+	if err := db.storage.CloseAndDeleteOlderFiles(oldIDs); err != nil {
+		return err
+	}
+
+	// 2. Mark OLD_DELETED so crash recovery never deletes newly moved files on ID overlap.
+	if err := createMarkerAtomic(tmpDir, mergeOldDeletedMarker); err != nil {
+		return err
+	}
+	if err := syncDir(tmpDir); err != nil {
+		return err
+	}
+
+	// 3. Move compacted files from .tmp/ into DirPath.
+	for _, id := range newIDs {
+		name := storage.DataFileName(id)
+		if err := os.Rename(filepath.Join(tmpDir, name), filepath.Join(db.options.DirPath, name)); err != nil {
+			return err
+		}
+	}
+
+	// 4. Register new compacted files into FileManager.olderFiles.
+	if err := db.storage.AdoptOlderFiles(newIDs); err != nil {
+		return err
+	}
+
+	// 5. Conditionally update KeyDir pointers now that new files are open and registered.
+	for _, r := range relocations {
+		expected := index.Item{FileID: r.oldFileID, RecordOffset: r.oldOffset}
+		db.index.CompareAndSwap(r.key, expected, r.newItem)
+	}
+
+	// 6. Persist directory renames and remove staging directory.
+	if err := syncDir(db.options.DirPath); err != nil {
+		return err
+	}
+	return os.RemoveAll(tmpDir)
 }
 
 // recoverMergeState runs during Open() before OpenFileManager scans *.data files.
 // It inspects dirPath/.tmp and completes or discards any interrupted compaction idempotently.
 func recoverMergeState(dirPath string) error {
-	// TODO(compaction): Implement the crash recovery matrix from docs/COMPACTION.md:
-	//
-	// tmpDir := filepath.Join(dirPath, mergeTempDirName)
-	// 1. If tmpDir does not exist (os.IsNotExist): return nil.
-	//
-	// 2. Check for COMMITTED and OLD_DELETED markers inside tmpDir:
-	//    - Case A: Neither COMMITTED nor OLD_DELETED exists:
-	//      Crash happened before commit point (Phase 1/2/3). Originals are intact.
-	//      Run os.RemoveAll(tmpDir) and return.
-	//
-	//    - Case B: COMMITTED exists, OLD_DELETED does NOT exist:
-	//      Read mergeManifest from filepath.Join(tmpDir, mergeManifestFile).
-	//      For each id in manifest.OldIDs:
-	//        Remove filepath.Join(dirPath, storage.DataFileName(id)) (ignore os.ErrNotExist).
-	//      Create mergeOldDeletedMarker atomically + syncDir(tmpDir).
-	//      (Fall through to Case C.)
-	//
-	//    - Case C: OLD_DELETED exists:
-	//      Read mergeManifest (if not already read in Case B).
-	//      For each id in manifest.NewIDs:
-	//        src := filepath.Join(tmpDir, storage.DataFileName(id))
-	//        dst := filepath.Join(dirPath, storage.DataFileName(id))
-	//        If src exists: os.Rename(src, dst). (If already moved before a prior crash, skip.)
-	//      Call syncDir(dirPath), then os.RemoveAll(tmpDir).
+	tmpDir := filepath.Join(dirPath, mergeTempDirName)
+	info, err := os.Stat(tmpDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return os.RemoveAll(tmpDir)
+	}
+
+	committed := fileExists(filepath.Join(tmpDir, mergeCommittedMarker))
+	oldDeleted := fileExists(filepath.Join(tmpDir, mergeOldDeletedMarker))
+
+	// Case A: Interrupted before commit point; originals are intact so discard .tmp/.
+	if !committed && !oldDeleted {
+		return os.RemoveAll(tmpDir)
+	}
+
+	manifest, err := readManifest(filepath.Join(tmpDir, mergeManifestFile))
+	if err != nil {
+		return err
+	}
+
+	// Case B: Committed, but old files may still remain; finish unlinking and mark OLD_DELETED.
+	if !oldDeleted {
+		for _, id := range manifest.OldIDs {
+			p := filepath.Join(dirPath, storage.DataFileName(id))
+			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		if err := createMarkerAtomic(tmpDir, mergeOldDeletedMarker); err != nil {
+			return err
+		}
+		if err := syncDir(tmpDir); err != nil {
+			return err
+		}
+	}
+
+	// Case C: OLD_DELETED exists; move any remaining compacted files from .tmp/ into dirPath.
+	for _, id := range manifest.NewIDs {
+		name := storage.DataFileName(id)
+		src := filepath.Join(tmpDir, name)
+		dst := filepath.Join(dirPath, name)
+		if fileExists(src) {
+			if err := os.Rename(src, dst); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := syncDir(dirPath); err != nil {
+		return err
+	}
+	return os.RemoveAll(tmpDir)
+}
+
+func writeManifest(path string, m mergeManifest) error {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, data)
+}
+
+func readManifest(path string) (mergeManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return mergeManifest{}, err
+	}
+	var m mergeManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return mergeManifest{}, err
+	}
+	return m, nil
+}
+
+func createMarkerAtomic(dir, name string) error {
+	return writeFileAtomic(filepath.Join(dir, name), nil)
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	tmpPath := path + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if len(data) > 0 {
+		if _, err := f.Write(data); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+
+	if err := d.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
+		return err
+	}
 	return nil
 }
 
-// TODO(compaction): Add helper functions as you implement merge.go:
-// - writeManifest(path string, m mergeManifest) error
-// - readManifest(path string) (mergeManifest, error)
-// - createMarkerAtomic(dir, name string) error
-// - syncDir(dir string) error (open dir with os.Open(dir), call Sync(), Close() — ignore EINVAL on filesystems that don't support dir fsync if needed)
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}

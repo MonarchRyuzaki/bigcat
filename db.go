@@ -181,17 +181,11 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return nil, ErrEmptyKey
 	}
 
-	// TODO(compaction): Hold db.mu.RLock() across db.index.Get AND db.storage.ReadAt
-	// (e.g., use defer db.mu.RUnlock() here instead of unlocking early).
-	// Why: Once Merge() swaps FileManager.olderFiles and reuses FileIDs in Phase 4 under db.mu.Lock(),
-	// releasing RLock early creates a TOCTOU race where Get() sees a FileID that gets deleted or
-	// replaced before ReadAt runs. Holding RLock keeps concurrent Get() calls parallel while blocking swap.
 	db.mu.RLock()
+	defer db.mu.RUnlock()
 	if db.isClosed {
-		db.mu.RUnlock()
 		return nil, ErrDatabaseClosed
 	}
-	db.mu.RUnlock()
 
 	// 1. Lookup in-memory index
 	item, exists := db.index.Get(string(key))
