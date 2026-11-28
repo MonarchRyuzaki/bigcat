@@ -25,11 +25,22 @@ const (
 
 	// DataFileFormat defines the zero-padded 5-digit file naming scheme (e.g. 00000.data).
 	DataFileFormat = "%05d" + DataFileSuffix
+
+	// HintFileSuffix is the extension used for companion BigCat hint files.
+	HintFileSuffix = ".hint"
+
+	// HintFileFormat defines the zero-padded 5-digit hint file naming scheme (e.g. 00000.hint).
+	HintFileFormat = "%05d" + HintFileSuffix
 )
 
 // DataFileName formats a numeric file ID into its standardized filename (e.g., 00001.data).
 func DataFileName(id uint32) string {
 	return fmt.Sprintf(DataFileFormat, id)
+}
+
+// HintFileName formats a numeric file ID into its companion hint filename (e.g., 00001.hint).
+func HintFileName(id uint32) string {
+	return fmt.Sprintf(HintFileFormat, id)
 }
 
 // ParseFileID extracts the numeric file ID from a filename like "00001.data".
@@ -256,7 +267,7 @@ func (fm *FileManager) SealedSnapshot() (sealedIDs []uint32, activeID uint32) {
 }
 
 // CloseAndDeleteOlderFiles detaches and closes the DataFile handles for fileIDs from olderFiles,
-// and unlinks their corresponding .data files from fm.dirPath.
+// and unlinks their corresponding .data and companion .hint files from fm.dirPath.
 // Called during compaction Phase 4 under DB lock before moving compacted files out of .tmp/.
 func (fm *FileManager) CloseAndDeleteOlderFiles(fileIDs []uint32) error {
 	fm.mu.Lock()
@@ -270,9 +281,11 @@ func (fm *FileManager) CloseAndDeleteOlderFiles(fileIDs []uint32) error {
 			}
 		}
 
-		err := os.Remove(filepath.Join(fm.dirPath, DataFileName(id)))
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+		for _, name := range []string{DataFileName(id), HintFileName(id)} {
+			err := os.Remove(filepath.Join(fm.dirPath, name))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
 		}
 	}
 	return nil

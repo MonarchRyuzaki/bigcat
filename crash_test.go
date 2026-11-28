@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"bigcat/internal/storage"
 )
 
 // TestCrashWorkerHelper is the child subprocess entrypoint used by SIGKILL chaos tests.
@@ -597,6 +599,18 @@ func TestCrash_DeterministicMergeFailpoints(t *testing.T) {
 
 			if _, err := os.Stat(filepath.Join(dir, mergeTempDirName)); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("expected .tmp cleaned up after recovery, got %v", err)
+			}
+
+			sealedIDs, _ := db2.storage.SealedSnapshot()
+			rolledBack := sc.firstFailpoint == "stage_mid_copy" || sc.firstFailpoint == "commit_after_manifest"
+			for _, id := range sealedIDs {
+				_, hintErr := os.Stat(filepath.Join(dir, storage.HintFileName(id)))
+				if rolledBack && !errors.Is(hintErr, os.ErrNotExist) {
+					t.Fatalf("expected no .hint for rolled-back sealed file %d, got %v", id, hintErr)
+				}
+				if !rolledBack && hintErr != nil {
+					t.Fatalf("expected companion .hint for rolled-forward sealed file %d: %v", id, hintErr)
+				}
 			}
 
 			for i := 0; i < 2; i++ {

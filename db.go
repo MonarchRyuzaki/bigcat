@@ -22,6 +22,7 @@ type DB struct {
 	storage   *storage.FileManager
 	index     index.Indexer
 	codec     record.Codec
+	hintCodec record.HintCodec
 	committer *GroupCommitter
 	isClosed  bool
 }
@@ -58,13 +59,14 @@ func Open(dirPath string, opts ...Option) (*DB, error) {
 	cdc := record.NewBinaryCodec()
 
 	db := &DB{
-		options: options,
-		storage: fileManager,
-		index:   idx,
-		codec:   cdc,
+		options:   options,
+		storage:   fileManager,
+		index:     idx,
+		codec:     cdc,
+		hintCodec: cdc,
 	}
 
-	// 5. Build in-memory KeyDir by sequentially scanning all data files from offset 0
+	// 5. Build in-memory KeyDir by sequentially scanning hint files (or raw .data files)
 	if err := db.loadIndexFromDisk(); err != nil {
 		_ = fileManager.Close()
 		_ = idx.Close()
@@ -77,25 +79,65 @@ func Open(dirPath string, opts ...Option) (*DB, error) {
 	return db, nil
 }
 
-// loadIndexFromDisk scans all managed data files in ascending order to recover the in-memory KeyDir index.
-// It wraps each file in a 256KB buffered reader to minimize disk syscalls during startup.
+// loadIndexFromDisk scans all managed file IDs in ascending order to recover the in-memory KeyDir index.
+// When a companion <file_id>.hint file exists, it reconstructs KeyDir exclusively from the hint file
+// (skipping all value payloads on disk). Otherwise, it falls back to scanning the raw .data file.
 func (db *DB) loadIndexFromDisk() error {
 	// FileIDs() returns all file IDs sorted in ascending order (e.g. 00000, 00001, ...)
 	fileIDs := db.storage.FileIDs()
+	reader := bufio.NewReaderSize(nil, 256*1024)
 
 	for _, fileID := range fileIDs {
+		hintPath := filepath.Join(db.options.DirPath, storage.HintFileName(fileID))
+		if hintFile, err := os.Open(hintPath); err == nil {
+			reader.Reset(hintFile)
+			scanErr := db.scanHintFile(fileID, reader)
+			_ = hintFile.Close()
+			if scanErr != nil {
+				return scanErr
+			}
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+
+		// Fallback: no companion .hint file (e.g. active or unmerged file) -> scan raw .data file
 		filePath := filepath.Join(db.options.DirPath, storage.DataFileName(fileID))
 		file, err := os.Open(filePath)
 		if err != nil {
 			return err
 		}
 
-		if err := db.scanDataFile(fileID, file); err != nil {
-			_ = file.Close()
+		reader.Reset(file)
+		scanErr := db.scanDataFileReader(fileID, reader)
+		_ = file.Close()
+		if scanErr != nil {
+			return scanErr
+		}
+	}
+
+	return nil
+}
+
+// scanHintFile sequentially decodes hint records from reader and populates the in-memory index
+// without reading any value payloads from the underlying .data file.
+func (db *DB) scanHintFile(fileID uint32, reader *bufio.Reader) error {
+	for {
+		hint, err := db.hintCodec.DecodeHint(reader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
 			return err
 		}
 
-		_ = file.Close()
+		recordSize := uint32(record.HeaderSize) + uint32(len(hint.Key)) + hint.ValueSize
+		db.index.Put(string(hint.Key), index.Item{
+			FileID:       fileID,
+			RecordOffset: hint.RecordOffset,
+			RecordSize:   recordSize,
+			Timestamp:    hint.Timestamp,
+		})
 	}
 
 	return nil
@@ -103,8 +145,11 @@ func (db *DB) loadIndexFromDisk() error {
 
 // scanDataFile sequentially reads records from a single data file and updates the in-memory index.
 func (db *DB) scanDataFile(fileID uint32, file *os.File) error {
-	// Use a 256KB buffer so sequential reads happen in userspace memory
 	reader := bufio.NewReaderSize(file, 256*1024)
+	return db.scanDataFileReader(fileID, reader)
+}
+
+func (db *DB) scanDataFileReader(fileID uint32, reader *bufio.Reader) error {
 	var currentOffset int64 = 0
 
 	for {
