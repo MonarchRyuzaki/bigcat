@@ -25,7 +25,7 @@ type Option func(*Options)
 // DefaultOptions returns the default production configuration.
 func DefaultOptions(dirPath string) Options {
 	return Options{
-		SyncOnWrite: false,
+		SyncOnWrite: true,
 		DirPath:     dirPath,
 		MaxFileSize: DefaultMaxFileSize,
 	}
